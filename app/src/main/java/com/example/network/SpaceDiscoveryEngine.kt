@@ -127,7 +127,7 @@ class SpaceDiscoveryEngine(
                     apiPrefix = configJson?.optString("api_prefix", "").orEmpty()
                     gradioVersion = configJson?.optString("version", gradioVersion).orEmpty()
                     val jwtFlag = dataObj?.optBoolean("jwtAttached", false) == true
-                    diagnostics.add("Connected via bundled @gradio/client@1.14.2 (view_api + config, jwtAttached=$jwtFlag).")
+                    diagnostics.add("Connected via bundled @gradio/client@2.8.0 (view_api + config, jwtAttached=$jwtFlag).")
                 }
             } else {
                 val errMsg = TokenRedactor.sanitize(sdkResult.exceptionOrNull()?.message.orEmpty())

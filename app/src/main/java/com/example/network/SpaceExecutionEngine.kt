@@ -23,11 +23,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -149,6 +149,20 @@ class SpaceExecutionEngine(
 
             try {
                 val attempts: List<ResolvedCredential?> = credentialChain.ifEmpty { listOf(null) }
+                val inputSummary = endpoint.inputs.joinToString(", ") { f ->
+                    val v = fieldValues[f.id] ?: defaultValueForField(f)
+                    when (v) {
+                        is FieldValue.MediaRef -> "${f.parameterName}:${f.kind.name}(${v.fileName.ifBlank { "empty" }})"
+                        is FieldValue.Text -> "${f.parameterName}:Text(${v.value.length}ch)"
+                        is FieldValue.NumberVal -> "${f.parameterName}:${v.value}"
+                        is FieldValue.BoolVal -> "${f.parameterName}:${v.value}"
+                        is FieldValue.MultiSelect -> "${f.parameterName}:[${v.values.size}]"
+                        is FieldValue.Empty -> "${f.parameterName}:null"
+                        else -> "${f.parameterName}:${f.kind.name}"
+                    }
+                }
+                onDiagnostic("Prepared ${endpoint.inputs.size} inputs for ${endpoint.callableTarget}: $inputSummary")
+
                 val jsPayload = buildJsSdkArgsIfSmallEnough(endpoint.inputs, fieldValues)
 
                 for ((attemptIdx, credential) in attempts.withIndex()) {
@@ -174,10 +188,10 @@ class SpaceExecutionEngine(
                     var retryWithNextCredential = false
                     var finishedJob = false
 
-                    // Priority 1: Official Bundled @gradio/client@1.14.2 with spaceId + token + Space JWT
+                    // Priority 1: Official Bundled @gradio/client@2.8.0 with incremental streaming SSE + per-job channel
                     if (jsPayload != null && hybridSdkBridge.awaitReady(timeoutMs = 2500L)) {
                         val jsAttemptJobId = "${jobId}_$attemptIdx"
-                        currentTransport = "@gradio/client@1.14.2 ($sourceLabel)"
+                        currentTransport = "@gradio/client@2.8.0 ($sourceLabel)"
                         _activeJob.update {
                             it.copy(
                                 status = JobStatus.QUEUED,
@@ -185,46 +199,52 @@ class SpaceExecutionEngine(
                                 progressMessage = "Submitting via @gradio/client ($sourceLabel)…"
                             )
                         }
-                        onDiagnostic("Priority 1: Submitting ${endpoint.callableTarget} via bundled @gradio/client@1.14.2.")
+                        onDiagnostic("Priority 1: Submitting ${endpoint.callableTarget} via bundled @gradio/client@2.8.0.")
 
-                        val submitRes = hybridSdkBridge.submitJob(
-                            jobId = jsAttemptJobId,
-                            sessionKey = manifest.identity.spaceId,
-                            spaceRef = manifest.identity.spaceId,
-                            token = token,
-                            spaceJwt = spaceJwt,
-                            endpoint = endpoint.callableTarget,
-                            rawArgsJson = jsPayload.toString()
-                        )
+                        // Open per-job buffered channel BEFORE calling submitJob so fast events are never lost
+                        val eventChannel = hybridSdkBridge.openJobEventChannel(jsAttemptJobId)
+                        try {
+                            val submitRes = hybridSdkBridge.submitJob(
+                                jobId = jsAttemptJobId,
+                                sessionKey = manifest.identity.spaceId,
+                                spaceRef = manifest.identity.spaceId,
+                                token = token,
+                                spaceJwt = spaceJwt,
+                                endpoint = endpoint.callableTarget,
+                                rawArgsJson = jsPayload.toString()
+                            )
 
-                        if (submitRes.isSuccess) {
-                            when (
-                                consumeJsJobEvents(
-                                    jsAttemptJobId = jsAttemptJobId,
-                                    recordJobId = jobId,
-                                    manifest = manifest,
-                                    endpoint = endpoint,
-                                    startedAt = startedAt,
-                                    declaredGpuSec = declaredGpuSec,
-                                    token = token,
-                                    spaceJwt = spaceJwt,
-                                    hasFallbackAuth = hasFallback,
-                                    onDiagnostic = onDiagnostic
-                                )
-                            ) {
-                                JsAttemptOutcome.COMPLETED, JsAttemptOutcome.FAILED -> {
-                                    finishedJob = true
+                            if (submitRes.isSuccess) {
+                                when (
+                                    consumeJsJobEvents(
+                                        eventChannel = eventChannel,
+                                        recordJobId = jobId,
+                                        manifest = manifest,
+                                        endpoint = endpoint,
+                                        startedAt = startedAt,
+                                        declaredGpuSec = declaredGpuSec,
+                                        token = token,
+                                        spaceJwt = spaceJwt,
+                                        hasFallbackAuth = hasFallback,
+                                        onDiagnostic = onDiagnostic
+                                    )
+                                ) {
+                                    JsAttemptOutcome.COMPLETED, JsAttemptOutcome.FAILED -> {
+                                        finishedJob = true
+                                    }
+                                    JsAttemptOutcome.RETRY_NEXT_AUTH -> {
+                                        retryWithNextCredential = true
+                                    }
+                                    JsAttemptOutcome.FALLBACK_TO_NATIVE -> {
+                                        // proceed to Priority 2 native client
+                                    }
                                 }
-                                JsAttemptOutcome.RETRY_NEXT_AUTH -> {
-                                    retryWithNextCredential = true
-                                }
-                                JsAttemptOutcome.FALLBACK_TO_NATIVE -> {
-                                    // proceed to Priority 2 native client
-                                }
+                            } else {
+                                val err = TokenRedactor.sanitize(submitRes.exceptionOrNull()?.message.orEmpty())
+                                onDiagnostic("@gradio/client submission fell back to native REST/SSE: $err")
                             }
-                        } else {
-                            val err = TokenRedactor.sanitize(submitRes.exceptionOrNull()?.message.orEmpty())
-                            onDiagnostic("@gradio/client submission fell back to native REST/SSE: $err")
+                        } finally {
+                            hybridSdkBridge.closeJobEventChannel(jsAttemptJobId)
                         }
                     }
 
@@ -281,7 +301,8 @@ class SpaceExecutionEngine(
                         dataArray = nativeArgs,
                         sessionHash = sessionHash,
                         token = token,
-                        spaceJwt = spaceJwt
+                        spaceJwt = spaceJwt,
+                        onDiagnostic = onDiagnostic
                     ) { event ->
                         when (event) {
                             is NativeStreamEvent.QueueStatus -> {
@@ -463,7 +484,7 @@ class SpaceExecutionEngine(
     }
 
     private suspend fun consumeJsJobEvents(
-        jsAttemptJobId: String,
+        eventChannel: Channel<SdkJobEvent>,
         recordJobId: String,
         manifest: SpaceManifest,
         endpoint: EndpointManifest,
@@ -476,23 +497,27 @@ class SpaceExecutionEngine(
     ): JsAttemptOutcome {
         var sawData = false
         while (true) {
-            val ev = hybridSdkBridge.jobEvents.first { it.jobId == jsAttemptJobId }
+            val ev = eventChannel.receive()
             when (ev.type) {
                 "status" -> {
                     val stage = ev.payload.optString("stage", "")
                     val pos = if (ev.payload.has("position") && !ev.payload.isNull("position")) ev.payload.optInt("position") else null
                     val size = if (ev.payload.has("size") && !ev.payload.isNull("size")) ev.payload.optInt("size") else null
                     val eta = if (ev.payload.has("eta") && !ev.payload.isNull("eta")) ev.payload.optDouble("eta") else null
-                    val msg = ev.payload.optString("message", stage)
+                    val title = ev.payload.optString("title", "").trim()
+                    val rawMsg = ev.payload.optString("message", "").trim()
+                    val combinedMsg = listOf(title, rawMsg).filter { it.isNotBlank() }.distinct().joinToString(" — ")
                     if (stage == "error") {
-                        val clean = TokenRedactor.sanitize(msg.ifBlank { "Space execution error" })
+                        val clean = TokenRedactor.sanitize(combinedMsg.ifBlank { "Gradio client reported stage=error with no details" })
                         val isAuthOrQuota = isQuotaOrHigherUsageError(clean) || isAuthError(clean)
                         if (isAuthOrQuota && hasFallbackAuth) {
                             onDiagnostic("@gradio/client reported auth/usage limit; switching to fallback credential: $clean")
                             return JsAttemptOutcome.RETRY_NEXT_AUTH
                         }
-                        if (!sawData && clean.contains("fetch", true)) {
-                            onDiagnostic("@gradio/client transport error, falling back to native SSE: $clean")
+                        // If @gradio/client failed before any output arrived and it isn't an explicit quota/auth rejection,
+                        // fall back to Native OkHttp Gradio REST/SSE (which also captures exact HTTP status & Python error details).
+                        if (!sawData && !isAuthOrQuota) {
+                            onDiagnostic("@gradio/client failed before output ($clean); falling back to Native Gradio REST/SSE…")
                             return JsAttemptOutcome.FALLBACK_TO_NATIVE
                         }
                         handleJobFailure(
@@ -509,7 +534,7 @@ class SpaceExecutionEngine(
                             queuePosition = pos ?: it.queuePosition,
                             queueSize = size ?: it.queueSize,
                             etaSeconds = eta ?: it.etaSeconds,
-                            progressMessage = msg.ifBlank { "Running via @gradio/client…" },
+                            progressMessage = combinedMsg.ifBlank { "Running via @gradio/client…" },
                             elapsedMs = System.currentTimeMillis() - startedAt
                         )
                     }
@@ -578,7 +603,7 @@ class SpaceExecutionEngine(
                         return JsAttemptOutcome.RETRY_NEXT_AUTH
                     }
                     if (!sawData && !isAuthOrQuota) {
-                        onDiagnostic("@gradio/client stream error before data, falling back to native SSE: $msg")
+                        onDiagnostic("@gradio/client stream error before data ($msg); falling back to Native Gradio REST/SSE…")
                         return JsAttemptOutcome.FALLBACK_TO_NATIVE
                     }
                     handleJobFailure(

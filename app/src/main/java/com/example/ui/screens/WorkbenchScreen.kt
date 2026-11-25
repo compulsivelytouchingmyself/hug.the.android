@@ -22,6 +22,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AddToHomeScreen
 import androidx.compose.material.icons.filled.ArrowDownward
@@ -31,6 +32,7 @@ import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.BookmarkBorder
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
@@ -404,7 +406,14 @@ fun WorkbenchScreen(
             // Live Job Status Card (always visible on Controls/Outputs when active or completed/failed)
             if (activeJob.status != JobStatus.IDLE && state.subTab != WorkbenchSubTab.FULL_SPACE) {
                 item {
-                    LiveJobStatusCard(job = activeJob, onOpenVault = onOpenVault)
+                    LiveJobStatusCard(
+                        job = activeJob,
+                        onOpenVault = onOpenVault,
+                        onCopyError = { text ->
+                            clipboard.setText(AnnotatedString(text))
+                            onShowMessage("Error details copied to clipboard")
+                        }
+                    )
                 }
             }
 
@@ -654,8 +663,9 @@ fun WorkbenchScreen(
                 }
             }
 
-            // Expandable Sanitized Technical Diagnostics
+            // Expandable Sanitized Technical Diagnostics (Selectable + One-Tap Copy)
             item {
+                val diagHeaderLine = "Host: ${manifest.identity.hostUrl} | Gradio: ${manifest.provenance.gradioVersion.ifBlank { "auto" }} | Transport: ${manifest.provenance.sdkTransportUsed}"
                 Surface(
                     color = ObsidianContainerLow,
                     shape = MaterialTheme.shapes.medium,
@@ -667,15 +677,39 @@ fun WorkbenchScreen(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clickable { diagnosticsExpanded = !diagnosticsExpanded }
-                                .padding(12.dp),
+                                .padding(horizontal = 12.dp, vertical = 6.dp),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
                                 text = "Technical Diagnostics (${diagnostics.size}) • Sanitized",
                                 style = MaterialTheme.typography.labelMedium,
-                                color = TextSecondary
+                                color = TextSecondary,
+                                modifier = Modifier.weight(1f)
                             )
+                            IconButton(
+                                onClick = {
+                                    val fullLog = buildString {
+                                        appendLine(diagHeaderLine)
+                                        if (!activeJob.errorMessage.isNullOrBlank()) {
+                                            appendLine("LAST ERROR: ${activeJob.errorMessage}")
+                                        }
+                                        diagnostics.take(40).forEach { ev ->
+                                            appendLine("[${ev.level}/${ev.source}] ${ev.message}")
+                                        }
+                                    }
+                                    clipboard.setText(AnnotatedString(fullLog))
+                                    onShowMessage("Copied ${diagnostics.take(40).size} diagnostic lines")
+                                },
+                                modifier = Modifier.minimumInteractiveComponentSize().testTag("copy_diagnostics_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.ContentCopy,
+                                    contentDescription = "Copy technical diagnostics",
+                                    tint = TelemetryCyan,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
                             Icon(
                                 imageVector = if (diagnosticsExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
                                 contentDescription = "Toggle diagnostics",
@@ -683,25 +717,27 @@ fun WorkbenchScreen(
                             )
                         }
                         AnimatedVisibility(visible = diagnosticsExpanded) {
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .background(ObsidianContainer)
-                                    .padding(12.dp),
-                                verticalArrangement = Arrangement.spacedBy(4.dp)
-                            ) {
-                                Text(
-                                    text = "Host: ${manifest.identity.hostUrl} | Gradio: ${manifest.provenance.gradioVersion.ifBlank { "auto" }} | Transport: ${manifest.provenance.sdkTransportUsed}",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = TelemetryCyan
-                                )
-                                HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp), color = HairlineBorder)
-                                diagnostics.take(25).forEach { ev ->
+                            SelectionContainer {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .background(ObsidianContainer)
+                                        .padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
                                     Text(
-                                        text = "[${ev.level}/${ev.source}] ${ev.message}",
+                                        text = diagHeaderLine,
                                         style = MaterialTheme.typography.labelSmall,
-                                        color = if (ev.level == "ERROR") StatusCrimson else TextSecondary
+                                        color = TelemetryCyan
                                     )
+                                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp), color = HairlineBorder)
+                                    diagnostics.take(40).forEach { ev ->
+                                        Text(
+                                            text = "[${ev.level}/${ev.source}] ${ev.message}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (ev.level == "ERROR") StatusCrimson else TextSecondary
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -1068,7 +1104,8 @@ fun WorkbenchScreen(
 @Composable
 private fun LiveJobStatusCard(
     job: ActiveJobState,
-    onOpenVault: () -> Unit
+    onOpenVault: () -> Unit,
+    onCopyError: (String) -> Unit
 ) {
     val accent = when (job.status) {
         JobStatus.COMPLETED -> StatusEmerald
@@ -1132,27 +1169,43 @@ private fun LiveJobStatusCard(
             }
 
             if (!job.errorMessage.isNullOrBlank()) {
-                Text(
-                    text = job.errorMessage,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = StatusCrimson
-                )
-                val errLower = job.errorMessage.lowercase()
-                if (errLower.contains("quota") ||
-                    errLower.contains("authenticate") ||
-                    errLower.contains("higher usage") ||
-                    errLower.contains("oauth") ||
-                    errLower.contains("vault") ||
-                    errLower.contains("401") ||
-                    errLower.contains("403")
+                SelectionContainer {
+                    Text(
+                        text = job.errorMessage,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = StatusCrimson
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
                     OutlinedButton(
-                        onClick = onOpenVault,
-                        modifier = Modifier.minimumInteractiveComponentSize().testTag("error_open_vault_button")
+                        onClick = { onCopyError(job.errorMessage) },
+                        modifier = Modifier.minimumInteractiveComponentSize().testTag("copy_error_button")
                     ) {
-                        Icon(Icons.Default.Key, contentDescription = null, modifier = Modifier.size(16.dp), tint = SignalAmber)
+                        Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(15.dp), tint = TelemetryCyan)
                         Spacer(Modifier.width(6.dp))
-                        Text("Configure Token / HF OAuth in Vault", color = SignalAmber, style = MaterialTheme.typography.labelMedium)
+                        Text("Copy Error", color = TelemetryCyan, style = MaterialTheme.typography.labelMedium)
+                    }
+                    val errLower = job.errorMessage.lowercase()
+                    if (errLower.contains("quota") ||
+                        errLower.contains("authenticate") ||
+                        errLower.contains("higher usage") ||
+                        errLower.contains("oauth") ||
+                        errLower.contains("vault") ||
+                        errLower.contains("401") ||
+                        errLower.contains("403")
+                    ) {
+                        OutlinedButton(
+                            onClick = onOpenVault,
+                            modifier = Modifier.minimumInteractiveComponentSize().testTag("error_open_vault_button")
+                        ) {
+                            Icon(Icons.Default.Key, contentDescription = null, modifier = Modifier.size(15.dp), tint = SignalAmber)
+                            Spacer(Modifier.width(6.dp))
+                            Text("Vault Auth", color = SignalAmber, style = MaterialTheme.typography.labelMedium)
+                        }
                     }
                 }
             }

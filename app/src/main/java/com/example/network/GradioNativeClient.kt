@@ -105,7 +105,8 @@ class GradioNativeClient(
         }
 
         val gradioVersion = configJson?.optString("version", "").orEmpty()
-        if (apiPrefix.isBlank() && gradioVersion.startsWith("5")) {
+        val majorVersion = gradioVersion.substringBefore('.').toIntOrNull() ?: 0
+        if (apiPrefix.isBlank() && majorVersion >= 5) {
             apiPrefix = "/gradio_api"
         }
 
@@ -208,12 +209,14 @@ class GradioNativeClient(
         sessionHash: String,
         token: String?,
         spaceJwt: String? = null,
+        onDiagnostic: ((String) -> Unit)? = null,
         onEvent: suspend (NativeStreamEvent) -> Unit
     ) = withContext(Dispatchers.IO) {
         val base = hostUrl.trimEnd('/')
         val cleanApiName = apiName?.trimStart('/')
+        val failureNotes = mutableListOf<String>()
 
-        // Strategy A: Gradio 4/5 /call/<api_name> two-step SSE
+        // Strategy A: Gradio 4/5/6 /call/<api_name> two-step SSE
         if (!cleanApiName.isNullOrBlank()) {
             val callUrls = buildList {
                 if (apiPrefix.isNotBlank()) add("$base$apiPrefix/call/$cleanApiName")
@@ -231,11 +234,14 @@ class GradioNativeClient(
                     okHttpClient.newCall(postReq).execute().use { resp ->
                         val body = resp.body?.string().orEmpty()
                         if (resp.isSuccessful) {
-                            runCatching { JSONObject(body).optString("event_id") }.getOrNull()
+                            val eid = runCatching { JSONObject(body).optString("event_id") }.getOrNull()
+                            onDiagnostic?.invoke("POST ${callUrl.removePrefix(base)} -> HTTP ${resp.code} (event_id=${eid?.take(10) ?: "none"})")
+                            eid
                         } else if (resp.code == 401 || resp.code == 403) {
+                            val cleanBody = TokenRedactor.sanitize(body.take(180))
                             onEvent(
                                 NativeStreamEvent.Error(
-                                    message = "Authentication required (HTTP ${resp.code}). Configure your Hugging Face token or OAuth sign-in in Vault.",
+                                    message = "Authentication required on ${callUrl.removePrefix(base)} (HTTP ${resp.code}): $cleanBody",
                                     isQuotaError = false,
                                     isAuthError = true
                                 )
@@ -244,20 +250,38 @@ class GradioNativeClient(
                         } else if (resp.code == 503) {
                             onEvent(NativeStreamEvent.Error("Space is sleeping or starting up (HTTP 503). Wait a moment and retry."))
                             return@withContext
-                        } else null
+                        } else {
+                            val note = "POST ${callUrl.removePrefix(base)} -> HTTP ${resp.code}: ${TokenRedactor.sanitize(body.take(200))}"
+                            failureNotes.add(note)
+                            onDiagnostic?.invoke(note)
+                            null
+                        }
                     }
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    val note = "POST ${callUrl.removePrefix(base)} exception: ${TokenRedactor.sanitize(e.message ?: "network error")}"
+                    failureNotes.add(note)
+                    onDiagnostic?.invoke(note)
                     null
                 }
 
                 if (!eventId.isNullOrBlank()) {
-                    streamCallSse("$callUrl/$eventId", token, spaceJwt, onEvent)
-                    return@withContext
+                    var blankCallError = false
+                    streamCallSse("$callUrl/$eventId", token, spaceJwt) { ev ->
+                        if (ev is NativeStreamEvent.Error && fnIndex != null && ev.message.contains("returned no details", ignoreCase = true)) {
+                            blankCallError = true
+                            failureNotes.add("/call/$cleanApiName returned empty error event; retrying via /queue/join for full traceback")
+                            onDiagnostic?.invoke("/call/$cleanApiName returned empty error event; retrying via /queue/join…")
+                        } else {
+                            onEvent(ev)
+                        }
+                    }
+                    if (!blankCallError) return@withContext
+                    break
                 }
             }
         }
 
-        // Strategy B: Queue join + SSE /queue/data (supports unnamed fn_index endpoints too)
+        // Strategy B: Queue join + SSE /queue/data (supports unnamed fn_index endpoints and full error/progress payloads)
         if (fnIndex != null) {
             val prefix = apiPrefix.ifBlank { "/gradio_api" }
             val joinCandidates = listOf("$base$prefix/queue/join", "$base/queue/join").distinct()
@@ -270,15 +294,20 @@ class GradioNativeClient(
                 val req = buildRequest(joinUrl, token, spaceJwt)
                     .post(joinBody.toRequestBody("application/json".toMediaTypeOrNull()))
                     .build()
-                val joinStatus = try {
-                    okHttpClient.newCall(req).execute().use { resp -> resp.code }
-                } catch (_: Exception) {
-                    -1
+                val (joinStatus, joinRespBody) = try {
+                    okHttpClient.newCall(req).execute().use { resp ->
+                        resp.code to resp.body?.string().orEmpty()
+                    }
+                } catch (e: Exception) {
+                    val note = "POST ${joinUrl.removePrefix(base)} exception: ${TokenRedactor.sanitize(e.message ?: "network error")}"
+                    failureNotes.add(note)
+                    onDiagnostic?.invoke(note)
+                    -1 to ""
                 }
                 if (joinStatus == 401 || joinStatus == 403) {
                     onEvent(
                         NativeStreamEvent.Error(
-                            message = "Authentication required for queue join (HTTP $joinStatus).",
+                            message = "Authentication required for queue join (HTTP $joinStatus): ${TokenRedactor.sanitize(joinRespBody.take(160))}",
                             isQuotaError = false,
                             isAuthError = true
                         )
@@ -286,9 +315,14 @@ class GradioNativeClient(
                     return@withContext
                 }
                 if (joinStatus in 200..299) {
+                    onDiagnostic?.invoke("Joined queue via ${joinUrl.removePrefix(base)} (HTTP $joinStatus, fn_index=$fnIndex)")
                     val dataUrl = joinUrl.replace("/queue/join", "/queue/data?session_hash=$sessionHash")
                     streamQueueDataSse(dataUrl, token, spaceJwt, onEvent)
                     return@withContext
+                } else if (joinStatus > 0) {
+                    val note = "POST ${joinUrl.removePrefix(base)} -> HTTP $joinStatus: ${TokenRedactor.sanitize(joinRespBody.take(200))}"
+                    failureNotes.add(note)
+                    onDiagnostic?.invoke(note)
                 }
             }
         }
@@ -307,12 +341,17 @@ class GradioNativeClient(
             okHttpClient.newCall(req).execute().use { resp ->
                 val body = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
-                    val sanitized = TokenRedactor.sanitize(body.take(220))
+                    val sanitized = TokenRedactor.sanitize(body.take(240))
+                    val priorSummary = failureNotes.takeLast(2).joinToString(" | ")
+                    val combined = buildString {
+                        append("Remote Space returned HTTP ${resp.code} on ${predictUrl.removePrefix(base)}: $sanitized")
+                        if (priorSummary.isNotBlank()) append("\nPrevious attempts: $priorSummary")
+                    }
                     onEvent(
                         NativeStreamEvent.Error(
-                            message = "Remote Space returned HTTP ${resp.code}: $sanitized",
-                            isQuotaError = isQuotaHint(sanitized),
-                            isAuthError = resp.code == 401 || resp.code == 403 || isAuthHint(sanitized)
+                            message = combined,
+                            isQuotaError = isQuotaHint(combined),
+                            isAuthError = resp.code == 401 || resp.code == 403 || isAuthHint(combined)
                         )
                     )
                     return@withContext
@@ -536,11 +575,11 @@ class GradioNativeClient(
     private fun parseErrorMessage(raw: String): String {
         val clean = TokenRedactor.sanitize(raw)
         if (clean == "null" || clean.isBlank()) {
-            return "The Space encountered a runtime or ZeroGPU quota error."
+            return "Remote Space /call endpoint returned no details (data: null) — likely a Python runtime error, invalid input, or ZeroGPU limit."
         }
         return runCatching {
             val o = JSONObject(clean)
-            o.optString("message", o.optString("error", clean))
+            o.optString("message", o.optString("error", o.optString("title", clean)))
         }.getOrDefault(clean)
     }
 

@@ -20,17 +20,20 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
+import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 data class SdkJobEvent(
@@ -41,32 +44,58 @@ data class SdkJobEvent(
 
 /**
  * Headless local-origin WebView hosting the pinned official JS SDKs:
- *   - @huggingface/hub@0.21.0
- *   - @gradio/client@1.14.2
+ *   - @huggingface/hub@2.17.11
+ *   - @gradio/client@2.8.0
  *
  * Strictly isolated to https://appassets.androidplatform.net/assets/sdk/runtime.html.
  * NEVER loads remote Space HTML or untrusted scripts.
- * Provides a host-allowlisted Native OkHttp fetch bridge to overcome WebView CORS limitations.
+ *
+ * Provides two host-allowlisted native OkHttp bridges:
+ *   1. nativeFetchAsync       — for ordinary REST & multipart uploads (non-SSE)
+ *   2. nativeStreamFetchAsync — incremental chunk-by-chunk streaming for Server-Sent Events (SSE)
  */
 class HybridSdkBridge(
     private val context: Context,
     private val okHttpClient: OkHttpClient
 ) {
+    private val sseHttpClient: OkHttpClient = okHttpClient.newBuilder()
+        .readTimeout(0, TimeUnit.SECONDS) // Required for long-lived SSE streams
+        .build()
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val callSeq = AtomicInteger(0)
     private val pendingCalls = ConcurrentHashMap<String, CompletableDeferred<JSONObject>>()
+    private val activeStreams = ConcurrentHashMap<String, Call>()
+    private val jobEventChannels = ConcurrentHashMap<String, Channel<SdkJobEvent>>()
     private val readyDeferred = CompletableDeferred<Boolean>()
 
-    private val _jobEvents = MutableSharedFlow<SdkJobEvent>(extraBufferCapacity = 128)
+    private val _jobEvents = MutableSharedFlow<SdkJobEvent>(
+        replay = 16,
+        extraBufferCapacity = 128
+    )
     val jobEvents: SharedFlow<SdkJobEvent> = _jobEvents.asSharedFlow()
 
     @Volatile
     private var webView: WebView? = null
 
     @Volatile
-    var sdkVersionsLabel: String = "@huggingface/hub@0.21.0 + @gradio/client@1.14.2"
+    var sdkVersionsLabel: String = "@huggingface/hub@2.17.11 + @gradio/client@2.8.0"
         private set
+
+    /**
+     * Registers a dedicated buffered channel for a job BEFORE calling submitJob(),
+     * guaranteeing that fast JS events emitted right after submission are never dropped.
+     */
+    fun openJobEventChannel(jobId: String): Channel<SdkJobEvent> {
+        val channel = Channel<SdkJobEvent>(capacity = Channel.UNLIMITED)
+        jobEventChannels[jobId] = channel
+        return channel
+    }
+
+    fun closeJobEventChannel(jobId: String) {
+        jobEventChannels.remove(jobId)?.close()
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     fun ensureInitialized() {
@@ -183,6 +212,8 @@ class HybridSdkBridge(
     }
 
     fun clearAllSessions() {
+        activeStreams.values.forEach { runCatching { it.cancel() } }
+        activeStreams.clear()
         val wv = webView ?: return
         mainHandler.post {
             wv.evaluateJavascript("window.SpaceDeckSdk && window.SpaceDeckSdk.clearAllSessions();", null)
@@ -226,6 +257,11 @@ class HybridSdkBridge(
     private fun quoteNullable(value: String?): String =
         if (value == null) "null" else JSONObject.quote(value)
 
+    private fun postJs(js: String) {
+        val wv = webView ?: return
+        mainHandler.post { wv.evaluateJavascript(js, null) }
+    }
+
     private inner class JsBridgeReceiver {
         @JavascriptInterface
         fun onSdkReady(payloadJson: String) {
@@ -233,7 +269,7 @@ class HybridSdkBridge(
                 val obj = JSONObject(payloadJson)
                 val v = obj.optJSONObject("versions")
                 if (v != null) {
-                    sdkVersionsLabel = "@huggingface/hub@${v.optString("huggingfaceHub", "0.21.0")} + @gradio/client@${v.optString("gradioClient", "1.14.2")}"
+                    sdkVersionsLabel = "@huggingface/hub@${v.optString("huggingfaceHub", "2.17.11")} + @gradio/client@${v.optString("gradioClient", "2.8.0")}"
                 }
             }
             readyDeferred.complete(true)
@@ -255,7 +291,9 @@ class HybridSdkBridge(
                 val jobId = obj.optString("jobId")
                 val type = obj.optString("type")
                 val payload = obj.optJSONObject("payload") ?: JSONObject()
-                _jobEvents.tryEmit(SdkJobEvent(jobId = jobId, type = type, payload = payload))
+                val event = SdkJobEvent(jobId = jobId, type = type, payload = payload)
+                jobEventChannels[jobId]?.trySend(event)
+                _jobEvents.tryEmit(event)
             }
         }
 
@@ -263,62 +301,85 @@ class HybridSdkBridge(
         fun nativeFetchAsync(reqId: String, reqJson: String) {
             scope.launch {
                 val responsePayload = executeNativeFetch(reqJson)
-                val wv = webView ?: return@launch
-                val js = "window.__resolveNativeFetch(${JSONObject.quote(reqId)}, ${JSONObject.quote(responsePayload)});"
-                mainHandler.post { wv.evaluateJavascript(js, null) }
+                postJs("window.__resolveNativeFetch(${JSONObject.quote(reqId)}, ${JSONObject.quote(responsePayload)});")
             }
+        }
+
+        @JavascriptInterface
+        fun nativeStreamFetchAsync(streamId: String, reqJson: String) {
+            scope.launch {
+                executeNativeStreamFetch(streamId, reqJson)
+            }
+        }
+
+        @JavascriptInterface
+        fun nativeStreamCancel(streamId: String) {
+            activeStreams.remove(streamId)?.cancel()
         }
     }
 
+    private fun buildNativeRequest(reqJson: String): Result<Request> = runCatching {
+        val reqObj = JSONObject(reqJson)
+        val url = reqObj.getString("url")
+        if (!AllowedHosts.isAllowedNetworkTarget(url)) {
+            throw SecurityException("Blocked fetch to untrusted host")
+        }
+        val method = reqObj.optString("method", "GET").uppercase()
+        val headersObj = reqObj.optJSONObject("headers")
+        val bodyText = if (reqObj.has("bodyText") && !reqObj.isNull("bodyText")) reqObj.getString("bodyText") else null
+        val bodyBase64 = if (reqObj.has("bodyBase64") && !reqObj.isNull("bodyBase64")) reqObj.getString("bodyBase64") else null
+
+        val builder = Request.Builder().url(url)
+        var contentType: String? = null
+        if (headersObj != null) {
+            val keys = headersObj.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                val v = headersObj.optString(k)
+                // Never forward Authorization to non-HF hosts
+                if (k.equals("Authorization", ignoreCase = true) && !AllowedHosts.isTrustedForCredentials(url)) {
+                    continue
+                }
+                if (k.equals("Content-Type", ignoreCase = true)) {
+                    contentType = v
+                }
+                builder.header(k, v)
+            }
+        }
+
+        if (method == "POST" || method == "PUT" || method == "PATCH" || method == "DELETE") {
+            val mediaType = (contentType ?: "application/json").toMediaTypeOrNull()
+            val reqBody = when {
+                bodyBase64 != null -> Base64.decode(bodyBase64, Base64.DEFAULT).toRequestBody(mediaType)
+                bodyText != null -> bodyText.toRequestBody(mediaType)
+                else -> ByteArray(0).toRequestBody(mediaType)
+            }
+            builder.method(method, reqBody)
+        } else {
+            builder.method(method, null)
+        }
+        builder.build()
+    }
+
+    /**
+     * Non-streaming REST & multipart upload bridge.
+     * Explicitly guards against buffering SSE (text/event-stream) responses.
+     */
     private fun executeNativeFetch(reqJson: String): String {
         return try {
-            val reqObj = JSONObject(reqJson)
-            val url = reqObj.getString("url")
-            if (!AllowedHosts.isAllowedNetworkTarget(url)) {
-                return JSONObject().put("error", "Blocked fetch to untrusted host").toString()
-            }
-            val method = reqObj.optString("method", "GET").uppercase()
-            val headersObj = reqObj.optJSONObject("headers")
-            val bodyText = if (reqObj.has("bodyText") && !reqObj.isNull("bodyText")) reqObj.getString("bodyText") else null
-            val bodyBase64 = if (reqObj.has("bodyBase64") && !reqObj.isNull("bodyBase64")) reqObj.getString("bodyBase64") else null
-
-            val builder = Request.Builder().url(url)
-            var contentType: String? = null
-            if (headersObj != null) {
-                val keys = headersObj.keys()
-                while (keys.hasNext()) {
-                    val k = keys.next()
-                    val v = headersObj.optString(k)
-                    // Never forward Authorization to non-HF hosts
-                    if (k.equals("Authorization", ignoreCase = true) && !AllowedHosts.isTrustedForCredentials(url)) {
-                        continue
-                    }
-                    if (k.equals("Content-Type", ignoreCase = true)) {
-                        contentType = v
-                    }
-                    builder.header(k, v)
+            val request = buildNativeRequest(reqJson).getOrThrow()
+            okHttpClient.newCall(request).execute().use { resp ->
+                val ct = resp.header("Content-Type").orEmpty()
+                if (ct.contains("text/event-stream", ignoreCase = true)) {
+                    return JSONObject()
+                        .put("error", "SSE response received on buffered REST bridge; use nativeStreamFetchAsync")
+                        .toString()
                 }
-            }
-
-            if (method == "POST" || method == "PUT" || method == "PATCH" || method == "DELETE") {
-                val mediaType = (contentType ?: "application/json").toMediaTypeOrNull()
-                val reqBody = when {
-                    bodyBase64 != null -> Base64.decode(bodyBase64, Base64.DEFAULT).toRequestBody(mediaType)
-                    bodyText != null -> bodyText.toRequestBody(mediaType)
-                    else -> ByteArray(0).toRequestBody(mediaType)
-                }
-                builder.method(method, reqBody)
-            } else {
-                builder.method(method, null)
-            }
-
-            okHttpClient.newCall(builder.build()).execute().use { resp ->
                 val respHeaders = JSONObject()
                 resp.headers.names().forEach { name ->
                     respHeaders.put(name, resp.header(name))
                 }
                 val bytes = resp.body?.bytes() ?: ByteArray(0)
-                val ct = resp.header("Content-Type").orEmpty()
                 val isText = ct.contains("json", true) || ct.contains("text", true) || ct.contains("javascript", true)
                 JSONObject().apply {
                     put("status", resp.code)
@@ -333,6 +394,55 @@ class HybridSdkBridge(
             }
         } catch (e: Exception) {
             JSONObject().put("error", TokenRedactor.sanitize(e.message ?: "Native fetch failed")).toString()
+        }
+    }
+
+    /**
+     * Incremental streaming OkHttp bridge for Server-Sent Events (SSE).
+     * Releases response headers immediately and streams chunks to JS as soon as bytes arrive
+     * from the socket—never buffering the full response body.
+     */
+    private fun executeNativeStreamFetch(streamId: String, reqJson: String) {
+        val request = buildNativeRequest(reqJson).getOrElse { err ->
+            val msg = TokenRedactor.sanitize(err.message ?: "Invalid stream request")
+            postJs("window.__onNativeStreamError(${JSONObject.quote(streamId)}, ${JSONObject.quote(msg)});")
+            return
+        }
+
+        val call = sseHttpClient.newCall(request)
+        activeStreams[streamId] = call
+        try {
+            call.execute().use { resp ->
+                val respHeaders = JSONObject()
+                resp.headers.names().forEach { name ->
+                    respHeaders.put(name, resp.header(name))
+                }
+                val metaJson = JSONObject().apply {
+                    put("status", resp.code)
+                    put("statusText", resp.message)
+                    put("headers", respHeaders)
+                }.toString()
+                postJs("window.__onNativeStreamOpen(${JSONObject.quote(streamId)}, ${JSONObject.quote(metaJson)});")
+
+                val inputStream = resp.body?.byteStream()
+                if (inputStream != null) {
+                    val buffer = ByteArray(4096)
+                    while (true) {
+                        val read = inputStream.read(buffer)
+                        if (read == -1) break
+                        if (read > 0) {
+                            val b64 = Base64.encodeToString(buffer, 0, read, Base64.NO_WRAP)
+                            postJs("window.__onNativeStreamChunk(${JSONObject.quote(streamId)}, ${JSONObject.quote(b64)});")
+                        }
+                    }
+                }
+                postJs("window.__onNativeStreamClose(${JSONObject.quote(streamId)});")
+            }
+        } catch (e: Exception) {
+            val msg = TokenRedactor.sanitize(e.message ?: "Native SSE stream failed")
+            postJs("window.__onNativeStreamError(${JSONObject.quote(streamId)}, ${JSONObject.quote(msg)});")
+        } finally {
+            activeStreams.remove(streamId)
         }
     }
 }

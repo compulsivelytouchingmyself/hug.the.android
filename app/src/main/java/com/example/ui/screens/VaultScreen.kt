@@ -20,6 +20,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Login
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
@@ -550,6 +551,10 @@ fun VaultScreen(
             JobHistoryCard(
                 job = job,
                 onOpenSpace = { onOpenSpace(job.spaceId) },
+                onCopyError = { err ->
+                    clipboard.setText(AnnotatedString(err))
+                    onCopyMessage("Copied job error to clipboard")
+                },
                 onDelete = { onDeleteJob(job.jobId) }
             )
         }
@@ -562,6 +567,7 @@ fun VaultScreen(
 private fun JobHistoryCard(
     job: JobRecordEntity,
     onOpenSpace: () -> Unit,
+    onCopyError: (String) -> Unit,
     onDelete: () -> Unit
 ) {
     val badgeColor = when (job.status) {
@@ -598,17 +604,27 @@ private fun JobHistoryCard(
                         modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                     )
                 }
+                if (!job.errorMessage.isNullOrBlank()) {
+                    IconButton(
+                        onClick = { onCopyError(job.errorMessage) },
+                        modifier = Modifier.minimumInteractiveComponentSize()
+                    ) {
+                        Icon(Icons.Default.ContentCopy, contentDescription = "Copy error", tint = TelemetryCyan, modifier = Modifier.size(16.dp))
+                    }
+                }
                 IconButton(onClick = onDelete, modifier = Modifier.minimumInteractiveComponentSize()) {
                     Icon(Icons.Default.Delete, contentDescription = stringResource(R.string.cd_delete), tint = TextMuted, modifier = Modifier.size(16.dp))
                 }
             }
-            Text(
-                text = job.errorMessage?.take(140) ?: job.summaryText,
-                style = MaterialTheme.typography.bodySmall,
-                color = if (job.errorMessage != null) StatusCrimson else TextSecondary,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis
-            )
+            SelectionContainer {
+                Text(
+                    text = job.errorMessage ?: job.summaryText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (job.errorMessage != null) StatusCrimson else TextSecondary,
+                    maxLines = 6,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(
                     "Elapsed: ${String.format(Locale.US, "%.1fs", job.elapsedMs / 1000.0)}",
