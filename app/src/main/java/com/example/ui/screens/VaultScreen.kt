@@ -1,5 +1,7 @@
 package com.example.ui.screens
 
+import android.content.Intent
+import android.net.Uri
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -19,16 +21,22 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Login
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -40,6 +48,7 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -48,8 +57,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
@@ -59,6 +71,8 @@ import com.example.R
 import com.example.data.local.JobRecordEntity
 import com.example.model.AccountInfo
 import com.example.model.SpaceAuthMode
+import com.example.security.AuthStrategy
+import com.example.security.HfOAuthManager
 import com.example.ui.components.oledTextFieldColors
 import com.example.ui.theme.HairlineBorder
 import com.example.ui.theme.ObsidianContainer
@@ -82,22 +96,39 @@ import java.util.Locale
 fun VaultScreen(
     accountInfo: AccountInfo?,
     hasDefaultToken: Boolean,
+    hasOAuthToken: Boolean,
+    oauthClientId: String,
+    authStrategy: AuthStrategy,
     isAnonymousMode: Boolean,
     isVerifyingToken: Boolean,
+    isOAuthInProgress: Boolean,
     tokenError: String?,
     perSpaceAuthModes: Map<String, SpaceAuthMode>,
     jobHistory: List<JobRecordEntity>,
     sdkVersionsLabel: String,
     onSaveAndVerifyToken: (String) -> Unit,
     onClearToken: () -> Unit,
+    onStartOAuth: (String) -> Intent?,
+    onClearOAuth: () -> Unit,
+    onSetAuthStrategy: (AuthStrategy) -> Unit,
     onSetAnonymousMode: (Boolean) -> Unit,
     onResetSpaceAuth: (String) -> Unit,
     onOpenSpace: (String) -> Unit,
     onDeleteJob: (String) -> Unit,
+    onCopyMessage: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
     var tokenInput by remember { mutableStateOf("") }
     var showToken by remember { mutableStateOf(false) }
+    var clientIdInput by remember { mutableStateOf(oauthClientId) }
+
+    LaunchedEffect(oauthClientId) {
+        if (clientIdInput.isBlank() && oauthClientId.isNotBlank()) {
+            clientIdInput = oauthClientId
+        }
+    }
 
     LazyColumn(
         modifier = modifier.fillMaxSize().background(OledBlack),
@@ -258,9 +289,184 @@ fun VaultScreen(
                     }
 
                     Text(
-                        text = "Tokens are encrypted with Android Keystore AES-256-GCM, restricted strictly to huggingface.co and *.hf.space, never logged, and excluded from profile exports.",
+                        text = "Credentials are encrypted with Android Keystore AES-256-GCM, automatically exchanged for signed Space JWTs (?__sign) for ZeroGPU quota attribution, restricted strictly to huggingface.co and *.hf.space, never logged, and excluded from profile exports.",
                         style = MaterialTheme.typography.labelSmall,
                         color = TextMuted
+                    )
+                }
+            }
+        }
+
+        // Hugging Face OAuth 2.0 + PKCE Sign-In Card (Dual-Path Fallback)
+        item {
+            Surface(
+                color = ObsidianContainerLow,
+                shape = MaterialTheme.shapes.medium,
+                border = BorderStroke(1.dp, if (hasOAuthToken) StatusEmerald.copy(alpha = 0.5f) else HairlineBorder),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Icon(Icons.AutoMirrored.Filled.Login, contentDescription = null, tint = TelemetryCyan)
+                            Text("Hugging Face OAuth (PKCE)", style = MaterialTheme.typography.titleMedium)
+                        }
+                        Surface(
+                            color = (if (hasOAuthToken) StatusEmerald else TextMuted).copy(alpha = 0.16f),
+                            shape = RoundedCornerShape(6.dp)
+                        ) {
+                            Text(
+                                text = if (hasOAuthToken) "CONNECTED" else "FALLBACK READY",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (hasOAuthToken) StatusEmerald else TextSecondary,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+
+                    Text(
+                        text = "Sign in with Hugging Face OAuth 2.0 (PKCE S256) as a primary credential or automatic fallback when a Space requests higher-usage authentication.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextSecondary
+                    )
+
+                    OutlinedTextField(
+                        value = clientIdInput,
+                        onValueChange = { clientIdInput = it },
+                        singleLine = true,
+                        label = { Text("HF OAuth App Client ID") },
+                        placeholder = { Text("Paste public OAuth client_id") },
+                        colors = oledTextFieldColors(),
+                        modifier = Modifier.fillMaxWidth().testTag("hf_oauth_client_id_input")
+                    )
+
+                    // Copyable Redirect URI for HF OAuth App setup
+                    Surface(
+                        color = ObsidianContainer,
+                        shape = MaterialTheme.shapes.small,
+                        border = BorderStroke(1.dp, HairlineBorder),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Redirect URI (for HF OAuth App)", style = MaterialTheme.typography.labelSmall, color = TextMuted)
+                                Text(HfOAuthManager.REDIRECT_URI, style = MaterialTheme.typography.bodySmall, color = TelemetryCyan)
+                            }
+                            IconButton(
+                                onClick = {
+                                    clipboard.setText(AnnotatedString(HfOAuthManager.REDIRECT_URI))
+                                    onCopyMessage("Copied OAuth Redirect URI")
+                                },
+                                modifier = Modifier.minimumInteractiveComponentSize()
+                            ) {
+                                Icon(Icons.Default.ContentCopy, contentDescription = "Copy Redirect URI", tint = TelemetryCyan)
+                            }
+                        }
+                    }
+
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Button(
+                            onClick = {
+                                val intent = onStartOAuth(clientIdInput)
+                                if (intent != null) {
+                                    runCatching { context.startActivity(intent) }
+                                        .onFailure { onCopyMessage("No browser found to launch Hugging Face OAuth.") }
+                                }
+                            },
+                            enabled = clientIdInput.isNotBlank() && !isOAuthInProgress,
+                            colors = ButtonDefaults.buttonColors(containerColor = TelemetryCyan, contentColor = Color.Black),
+                            modifier = Modifier.weight(1f).minimumInteractiveComponentSize().testTag("start_hf_oauth_button")
+                        ) {
+                            if (isOAuthInProgress) {
+                                CircularProgressIndicator(modifier = Modifier.size(18.dp), color = Color.Black, strokeWidth = 2.dp)
+                            } else {
+                                Text(if (hasOAuthToken) "Re-Sign in with HF" else "Sign in with HF (OAuth)")
+                            }
+                        }
+                        if (hasOAuthToken) {
+                            OutlinedButton(
+                                onClick = onClearOAuth,
+                                modifier = Modifier.minimumInteractiveComponentSize().testTag("clear_oauth_button")
+                            ) {
+                                Text("Disconnect", color = StatusCrimson)
+                            }
+                        }
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            runCatching {
+                                context.startActivity(
+                                    Intent(Intent.ACTION_VIEW, Uri.parse("https://huggingface.co/settings/connected-applications"))
+                                )
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth().minimumInteractiveComponentSize()
+                    ) {
+                        Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Manage / Create HF OAuth App", style = MaterialTheme.typography.labelMedium)
+                    }
+                }
+            }
+        }
+
+        // Dual-Path Auth Priority & Automatic Fallback Card
+        item {
+            Surface(
+                color = ObsidianContainerLow,
+                shape = MaterialTheme.shapes.medium,
+                border = BorderStroke(1.dp, HairlineBorder),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Icon(Icons.Default.SwapHoriz, contentDescription = null, tint = SignalAmber)
+                        Text("Dual-Path Auth Strategy", style = MaterialTheme.typography.titleMedium)
+                    }
+                    Text(
+                        text = "SpaceDeck exchanges your active credential for a Space-scoped JWT (?__sign) on every run. If the primary credential hits a ZeroGPU usage or auth error, SpaceDeck automatically retries using your fallback path.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextSecondary
+                    )
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        AuthStrategy.entries.forEach { strat ->
+                            val selected = authStrategy == strat
+                            FilterChip(
+                                selected = selected,
+                                onClick = { onSetAuthStrategy(strat) },
+                                label = {
+                                    Text(
+                                        text = strat.label,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = SignalAmber,
+                                    selectedLabelColor = Color.Black
+                                ),
+                                modifier = Modifier.weight(1f).testTag("auth_strategy_${strat.name.lowercase()}")
+                            )
+                        }
+                    }
+                    val activeSummary = buildList {
+                        if (hasDefaultToken) add("Access Token")
+                        if (hasOAuthToken) add("HF OAuth")
+                    }.ifEmpty { listOf("Anonymous only") }.joinToString(" + ")
+                    Text(
+                        text = "Configured paths: $activeSummary",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (hasDefaultToken || hasOAuthToken) StatusEmerald else StatusWarning
                     )
                 }
             }

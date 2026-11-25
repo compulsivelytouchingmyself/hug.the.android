@@ -174,7 +174,12 @@ fun FullSpaceWebView(
                             useWideViewPort = true
                             loadWithOverviewMode = true
                         }
-                        CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                        val wv = this
+                        CookieManager.getInstance().apply {
+                            setAcceptCookie(true)
+                            setAcceptThirdPartyCookies(wv, true)
+                            flush()
+                        }
                         webChromeClient = object : WebChromeClient() {
                             override fun onProgressChanged(view: WebView?, newProgress: Int) {
                                 progress = newProgress

@@ -70,6 +70,14 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="https" android:host="*.hf.space" />
             </intent-filter>
+
+            <!-- Hugging Face OAuth 2.0 PKCE callback -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="spacedeck" android:host="oauth" android:path="/callback" />
+            </intent-filter>
         </activity>
 
         <service

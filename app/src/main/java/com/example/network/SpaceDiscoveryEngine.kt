@@ -100,11 +100,23 @@ class SpaceDiscoveryEngine(
         val warnings = mutableListOf<String>()
 
         if (runtimeStage != RuntimeStage.SLEEPING && runtimeStage != RuntimeStage.PAUSED && runtimeStage != RuntimeStage.STOPPED) {
-            // Try bundled @gradio/client first
+            val spaceJwt = if (!token.isNullOrBlank()) {
+                hubClient.fetchSpaceJwt(resolvedSpaceId, token).getOrNull()
+            } else null
+
+            val authLabel = when {
+                !token.isNullOrBlank() && !spaceJwt.isNullOrBlank() -> "Bearer + Space JWT (__sign)"
+                !token.isNullOrBlank() -> "Bearer only"
+                else -> "Anonymous"
+            }
+            diagnostics.add("Discovery auth context: $authLabel")
+
+            // Try bundled @gradio/client first using canonical spaceId so HF Space JWT/config binds properly
             val sdkResult = hybridSdkBridge.connectAndInspect(
                 sessionKey = resolvedSpaceId,
-                spaceRef = hostUrl,
-                token = token
+                spaceRef = resolvedSpaceId,
+                token = token,
+                spaceJwt = spaceJwt
             )
             if (sdkResult.isSuccess) {
                 val dataObj = sdkResult.getOrNull()?.optJSONObject("data")
@@ -114,7 +126,8 @@ class SpaceDiscoveryEngine(
                     sdkTransportUsed = "gradio_js_client"
                     apiPrefix = configJson?.optString("api_prefix", "").orEmpty()
                     gradioVersion = configJson?.optString("version", gradioVersion).orEmpty()
-                    diagnostics.add("Connected via bundled @gradio/client@1.14.2 (view_api + config).")
+                    val jwtFlag = dataObj?.optBoolean("jwtAttached", false) == true
+                    diagnostics.add("Connected via bundled @gradio/client@1.14.2 (view_api + config, jwtAttached=$jwtFlag).")
                 }
             } else {
                 val errMsg = TokenRedactor.sanitize(sdkResult.exceptionOrNull()?.message.orEmpty())
@@ -123,7 +136,7 @@ class SpaceDiscoveryEngine(
 
             // Fill missing Live API or Runtime /config via version-aware Native Gradio client
             if (apiInfoJson == null || configJson == null) {
-                val nativeBundle = gradioNativeClient.fetchRuntimeBundle(hostUrl, token)
+                val nativeBundle = gradioNativeClient.fetchRuntimeBundle(hostUrl, token, spaceJwt)
                 if (configJson == null) configJson = nativeBundle.configJson
                 if (apiInfoJson == null) apiInfoJson = nativeBundle.apiInfoJson
                 if (apiPrefix.isBlank()) apiPrefix = nativeBundle.apiPrefix

@@ -14,6 +14,8 @@ import com.example.model.FieldValue
 import com.example.model.JobStatus
 import com.example.model.OutputItem
 import com.example.model.SpaceManifest
+import com.example.security.AuthCredentialSource
+import com.example.security.ResolvedCredential
 import com.example.security.TokenRedactor
 import com.example.service.SpaceJobMonitorService
 import kotlinx.coroutines.CancellationException
@@ -36,11 +38,19 @@ import java.util.UUID
 
 class SpaceExecutionEngine(
     private val context: Context,
+    private val hubClient: HfHubClient,
     private val hybridSdkBridge: HybridSdkBridge,
     private val gradioNativeClient: GradioNativeClient,
     private val mediaLibraryManager: MediaLibraryManager,
     private val jobRecordDao: JobRecordDao
 ) {
+    private enum class JsAttemptOutcome {
+        COMPLETED,
+        FALLBACK_TO_NATIVE,
+        RETRY_NEXT_AUTH,
+        FAILED
+    }
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val sessionHashes = mutableMapOf<String, String>()
 
@@ -55,6 +65,7 @@ class SpaceExecutionEngine(
     private var currentSpaceHost: String = ""
     private var currentApiPrefix: String = ""
     private var currentToken: String? = null
+    private var currentSpaceJwt: String? = null
     private var currentSessionHash: String = ""
     private var currentTransport: String = ""
 
@@ -69,7 +80,7 @@ class SpaceExecutionEngine(
         manifest: SpaceManifest,
         endpoint: EndpointManifest,
         fieldValues: Map<String, FieldValue>,
-        token: String?,
+        credentialChain: List<ResolvedCredential>,
         onDiagnostic: (String) -> Unit
     ) {
         currentRunJob?.cancel()
@@ -82,7 +93,8 @@ class SpaceExecutionEngine(
         }
         currentSpaceHost = manifest.identity.hostUrl
         currentApiPrefix = manifest.provenance.apiPrefix
-        currentToken = token
+        currentToken = credentialChain.firstOrNull()?.token
+        currentSpaceJwt = null
         currentSessionHash = sessionHash
         currentTransport = ""
 
@@ -96,7 +108,7 @@ class SpaceExecutionEngine(
             endpointLabel = endpoint.label,
             status = JobStatus.UPLOADING,
             transport = "initializing",
-            progressMessage = "Preparing inputs…",
+            progressMessage = "Preparing inputs & Space auth…",
             startedAtMs = startedAt,
             elapsedMs = 0L,
             declaredZeroGpuSeconds = declaredGpuSec
@@ -136,52 +148,109 @@ class SpaceExecutionEngine(
             )
 
             try {
-                // Priority 1: Try Official Bundled @gradio/client (handle_file + app.submit)
+                val attempts: List<ResolvedCredential?> = credentialChain.ifEmpty { listOf(null) }
                 val jsPayload = buildJsSdkArgsIfSmallEnough(endpoint.inputs, fieldValues)
-                var completedViaJs = false
 
-                if (jsPayload != null && hybridSdkBridge.awaitReady(timeoutMs = 2500L)) {
-                    currentTransport = "@gradio/client@1.14.2"
-                    _activeJob.update {
-                        it.copy(
-                            status = JobStatus.QUEUED,
-                            transport = currentTransport,
-                            progressMessage = "Submitting via @gradio/client…"
-                        )
+                for ((attemptIdx, credential) in attempts.withIndex()) {
+                    val hasFallback = attemptIdx < attempts.lastIndex
+                    val token = credential?.token
+                    val sourceLabel = credential?.source?.label ?: AuthCredentialSource.ANONYMOUS.label
+
+                    // Exchange user token / OAuth token for a Space-scoped signed JWT (?__sign=<jwt>)
+                    val spaceJwt = if (!token.isNullOrBlank()) {
+                        hubClient.fetchSpaceJwt(manifest.identity.spaceId, token).getOrNull()
+                    } else null
+
+                    currentToken = token
+                    currentSpaceJwt = spaceJwt
+
+                    val authTransportNote = when {
+                        !token.isNullOrBlank() && !spaceJwt.isNullOrBlank() -> "Bearer + Space JWT (__sign)"
+                        !token.isNullOrBlank() -> "Bearer only (JWT unavailable)"
+                        else -> "Anonymous"
                     }
-                    onDiagnostic("Priority 1: Submitting ${endpoint.callableTarget} via bundled @gradio/client@1.14.2.")
+                    onDiagnostic("Auth path ${attemptIdx + 1}/${attempts.size}: Using $sourceLabel ($authTransportNote)")
 
-                    val submitRes = hybridSdkBridge.submitJob(
-                        jobId = jobId,
-                        sessionKey = manifest.identity.spaceId,
-                        spaceRef = manifest.identity.hostUrl,
-                        token = token,
-                        endpoint = endpoint.callableTarget,
-                        rawArgsJson = jsPayload.toString()
-                    )
+                    var retryWithNextCredential = false
+                    var finishedJob = false
 
-                    if (submitRes.isSuccess) {
-                        val jsOutcome = consumeJsJobEvents(jobId, manifest, endpoint, startedAt, declaredGpuSec, token, onDiagnostic)
-                        if (jsOutcome) {
-                            completedViaJs = true
+                    // Priority 1: Official Bundled @gradio/client@1.14.2 with spaceId + token + Space JWT
+                    if (jsPayload != null && hybridSdkBridge.awaitReady(timeoutMs = 2500L)) {
+                        val jsAttemptJobId = "${jobId}_$attemptIdx"
+                        currentTransport = "@gradio/client@1.14.2 ($sourceLabel)"
+                        _activeJob.update {
+                            it.copy(
+                                status = JobStatus.QUEUED,
+                                transport = currentTransport,
+                                progressMessage = "Submitting via @gradio/client ($sourceLabel)…"
+                            )
                         }
-                    } else {
-                        val err = TokenRedactor.sanitize(submitRes.exceptionOrNull()?.message.orEmpty())
-                        onDiagnostic("@gradio/client submission fell back to native REST/SSE: $err")
-                    }
-                }
+                        onDiagnostic("Priority 1: Submitting ${endpoint.callableTarget} via bundled @gradio/client@1.14.2.")
 
-                // Priority 2 & 3: Version-Aware Native Kotlin Gradio REST/SSE + Native OkHttp Multipart Upload
-                if (!completedViaJs) {
-                    currentTransport = "native_gradio_sse"
+                        val submitRes = hybridSdkBridge.submitJob(
+                            jobId = jsAttemptJobId,
+                            sessionKey = manifest.identity.spaceId,
+                            spaceRef = manifest.identity.spaceId,
+                            token = token,
+                            spaceJwt = spaceJwt,
+                            endpoint = endpoint.callableTarget,
+                            rawArgsJson = jsPayload.toString()
+                        )
+
+                        if (submitRes.isSuccess) {
+                            when (
+                                consumeJsJobEvents(
+                                    jsAttemptJobId = jsAttemptJobId,
+                                    recordJobId = jobId,
+                                    manifest = manifest,
+                                    endpoint = endpoint,
+                                    startedAt = startedAt,
+                                    declaredGpuSec = declaredGpuSec,
+                                    token = token,
+                                    spaceJwt = spaceJwt,
+                                    hasFallbackAuth = hasFallback,
+                                    onDiagnostic = onDiagnostic
+                                )
+                            ) {
+                                JsAttemptOutcome.COMPLETED, JsAttemptOutcome.FAILED -> {
+                                    finishedJob = true
+                                }
+                                JsAttemptOutcome.RETRY_NEXT_AUTH -> {
+                                    retryWithNextCredential = true
+                                }
+                                JsAttemptOutcome.FALLBACK_TO_NATIVE -> {
+                                    // proceed to Priority 2 native client
+                                }
+                            }
+                        } else {
+                            val err = TokenRedactor.sanitize(submitRes.exceptionOrNull()?.message.orEmpty())
+                            onDiagnostic("@gradio/client submission fell back to native REST/SSE: $err")
+                        }
+                    }
+
+                    if (finishedJob) break
+                    if (retryWithNextCredential && hasFallback) {
+                        val nextLabel = attempts[attemptIdx + 1]?.source?.label ?: "fallback"
+                        onDiagnostic("Switching from $sourceLabel to fallback auth ($nextLabel)…")
+                        _activeJob.update {
+                            it.copy(
+                                status = JobStatus.QUEUED,
+                                progressMessage = "Retrying with $nextLabel…"
+                            )
+                        }
+                        continue
+                    }
+
+                    // Priority 2 & 3: Version-Aware Native Kotlin Gradio REST/SSE + Native OkHttp Multipart Upload
+                    currentTransport = "native_gradio_sse ($sourceLabel)"
                     _activeJob.update {
                         it.copy(
                             status = JobStatus.UPLOADING,
                             transport = currentTransport,
-                            progressMessage = "Uploading files via native HTTP…"
+                            progressMessage = "Uploading files via native HTTP ($sourceLabel)…"
                         )
                     }
-                    onDiagnostic("Priority 2: Running ${endpoint.callableTarget} via version-aware Native Gradio REST/SSE.")
+                    onDiagnostic("Priority 2: Running ${endpoint.callableTarget} via Native Gradio REST/SSE ($authTransportNote).")
 
                     val nativeArgs = buildNativeArgsWithUploads(
                         hostUrl = manifest.identity.hostUrl,
@@ -189,17 +258,20 @@ class SpaceExecutionEngine(
                         fields = endpoint.inputs,
                         values = fieldValues,
                         token = token,
+                        spaceJwt = spaceJwt,
                         onDiagnostic = onDiagnostic
                     )
 
                     _activeJob.update {
-                        it.copy(status = JobStatus.QUEUED, progressMessage = "Joining Space queue…")
+                        it.copy(status = JobStatus.QUEUED, progressMessage = "Joining Space queue ($sourceLabel)…")
                     }
                     SpaceJobMonitorService.updateProgress(
                         context,
                         "${manifest.identity.title} • ${endpoint.label}",
                         "Running on remote Space…"
                     )
+
+                    var nativeAuthFallbackTriggered = false
 
                     gradioNativeClient.executeEndpoint(
                         hostUrl = manifest.identity.hostUrl,
@@ -208,7 +280,8 @@ class SpaceExecutionEngine(
                         fnIndex = endpoint.fnIndex,
                         dataArray = nativeArgs,
                         sessionHash = sessionHash,
-                        token = token
+                        token = token,
+                        spaceJwt = spaceJwt
                     ) { event ->
                         when (event) {
                             is NativeStreamEvent.QueueStatus -> {
@@ -234,6 +307,7 @@ class SpaceExecutionEngine(
                                     spaceId = manifest.identity.spaceId,
                                     jobId = jobId,
                                     token = token,
+                                    spaceJwt = spaceJwt,
                                     cacheMedia = false
                                 )
                                 _outputs.value = parsed
@@ -255,6 +329,7 @@ class SpaceExecutionEngine(
                                     spaceId = manifest.identity.spaceId,
                                     jobId = jobId,
                                     token = token,
+                                    spaceJwt = spaceJwt,
                                     cacheMedia = true
                                 )
                                 _outputs.value = parsed
@@ -286,22 +361,43 @@ class SpaceExecutionEngine(
                                     "${manifest.identity.title} finished",
                                     summarizeOutputs(parsed)
                                 )
-                                onDiagnostic("Completed in ${(now - startedAt) / 1000.0}s with ${parsed.size} outputs.")
+                                onDiagnostic("Completed in ${(now - startedAt) / 1000.0}s with ${parsed.size} outputs ($sourceLabel).")
+                                finishedJob = true
                             }
                             is NativeStreamEvent.Error -> {
-                                handleJobFailure(
-                                    jobId = jobId,
-                                    manifest = manifest,
-                                    endpoint = endpoint,
-                                    startedAt = startedAt,
-                                    declaredGpuSec = declaredGpuSec,
-                                    error = event.message,
-                                    isQuota = event.isQuotaError,
-                                    onDiagnostic = onDiagnostic
-                                )
+                                if ((event.isAuthError || event.isQuotaError) && hasFallback) {
+                                    nativeAuthFallbackTriggered = true
+                                    val nextLabel = attempts[attemptIdx + 1]?.source?.label ?: "fallback"
+                                    onDiagnostic("$sourceLabel hit auth/usage limit (${event.message.take(120)}). Falling back to $nextLabel…")
+                                } else {
+                                    handleJobFailure(
+                                        jobId = jobId,
+                                        manifest = manifest,
+                                        endpoint = endpoint,
+                                        startedAt = startedAt,
+                                        declaredGpuSec = declaredGpuSec,
+                                        error = event.message,
+                                        isQuota = event.isQuotaError,
+                                        onDiagnostic = onDiagnostic
+                                    )
+                                    finishedJob = true
+                                }
                             }
                         }
                     }
+
+                    if (finishedJob) break
+                    if (nativeAuthFallbackTriggered && hasFallback) {
+                        val nextLabel = attempts[attemptIdx + 1]?.source?.label ?: "fallback"
+                        _activeJob.update {
+                            it.copy(
+                                status = JobStatus.QUEUED,
+                                progressMessage = "Falling back to $nextLabel…"
+                            )
+                        }
+                        continue
+                    }
+                    break
                 }
             } catch (_: CancellationException) {
                 val now = System.currentTimeMillis()
@@ -335,7 +431,7 @@ class SpaceExecutionEngine(
                     startedAt = startedAt,
                     declaredGpuSec = declaredGpuSec,
                     error = clean,
-                    isQuota = clean.contains("quota", true) || clean.contains("zerogpu", true),
+                    isQuota = isQuotaOrHigherUsageError(clean),
                     onDiagnostic = onDiagnostic
                 )
             } finally {
@@ -352,7 +448,13 @@ class SpaceExecutionEngine(
             if (currentTransport.contains("gradio/client")) {
                 hybridSdkBridge.cancelJob(active.jobId)
             } else if (currentSpaceHost.isNotBlank() && currentSessionHash.isNotBlank()) {
-                gradioNativeClient.cancelSession(currentSpaceHost, currentApiPrefix, currentSessionHash, currentToken)
+                gradioNativeClient.cancelSession(
+                    hostUrl = currentSpaceHost,
+                    apiPrefix = currentApiPrefix,
+                    sessionHash = currentSessionHash,
+                    token = currentToken,
+                    spaceJwt = currentSpaceJwt
+                )
             }
         }
         currentRunJob?.cancel()
@@ -361,17 +463,20 @@ class SpaceExecutionEngine(
     }
 
     private suspend fun consumeJsJobEvents(
-        jobId: String,
+        jsAttemptJobId: String,
+        recordJobId: String,
         manifest: SpaceManifest,
         endpoint: EndpointManifest,
         startedAt: Long,
         declaredGpuSec: Int?,
         token: String?,
+        spaceJwt: String?,
+        hasFallbackAuth: Boolean,
         onDiagnostic: (String) -> Unit
-    ): Boolean {
+    ): JsAttemptOutcome {
         var sawData = false
         while (true) {
-            val ev = hybridSdkBridge.jobEvents.first { it.jobId == jobId }
+            val ev = hybridSdkBridge.jobEvents.first { it.jobId == jsAttemptJobId }
             when (ev.type) {
                 "status" -> {
                     val stage = ev.payload.optString("stage", "")
@@ -381,18 +486,22 @@ class SpaceExecutionEngine(
                     val msg = ev.payload.optString("message", stage)
                     if (stage == "error") {
                         val clean = TokenRedactor.sanitize(msg.ifBlank { "Space execution error" })
+                        val isAuthOrQuota = isQuotaOrHigherUsageError(clean) || isAuthError(clean)
+                        if (isAuthOrQuota && hasFallbackAuth) {
+                            onDiagnostic("@gradio/client reported auth/usage limit; switching to fallback credential: $clean")
+                            return JsAttemptOutcome.RETRY_NEXT_AUTH
+                        }
                         if (!sawData && clean.contains("fetch", true)) {
-                            // Allow fallback to native HTTP client on transport/CORS errors before any output
                             onDiagnostic("@gradio/client transport error, falling back to native SSE: $clean")
-                            return false
+                            return JsAttemptOutcome.FALLBACK_TO_NATIVE
                         }
                         handleJobFailure(
-                            jobId, manifest, endpoint, startedAt, declaredGpuSec,
+                            recordJobId, manifest, endpoint, startedAt, declaredGpuSec,
                             error = clean,
-                            isQuota = clean.contains("quota", true) || clean.contains("zerogpu", true),
+                            isQuota = isQuotaOrHigherUsageError(clean),
                             onDiagnostic = onDiagnostic
                         )
-                        return true
+                        return JsAttemptOutcome.FAILED
                     }
                     _activeJob.update {
                         it.copy(
@@ -414,8 +523,9 @@ class SpaceExecutionEngine(
                         hostUrl = manifest.identity.hostUrl,
                         apiPrefix = manifest.provenance.apiPrefix,
                         spaceId = manifest.identity.spaceId,
-                        jobId = jobId,
+                        jobId = recordJobId,
                         token = token,
+                        spaceJwt = spaceJwt,
                         cacheMedia = true
                     )
                     _outputs.value = parsed
@@ -441,7 +551,7 @@ class SpaceExecutionEngine(
                         )
                     }
                     persistJobRecord(
-                        jobId = jobId,
+                        jobId = recordJobId,
                         manifest = manifest,
                         endpoint = endpoint,
                         status = JobStatus.COMPLETED,
@@ -458,24 +568,51 @@ class SpaceExecutionEngine(
                         "${manifest.identity.title} finished",
                         summarizeOutputs(finalOutputs)
                     )
-                    return true
+                    return JsAttemptOutcome.COMPLETED
                 }
                 "error" -> {
                     val msg = TokenRedactor.sanitize(ev.payload.optString("message", "Execution error"))
-                    if (!sawData) {
+                    val isAuthOrQuota = isQuotaOrHigherUsageError(msg) || isAuthError(msg)
+                    if (isAuthOrQuota && hasFallbackAuth) {
+                        onDiagnostic("@gradio/client hit auth/usage limit; switching to fallback credential: $msg")
+                        return JsAttemptOutcome.RETRY_NEXT_AUTH
+                    }
+                    if (!sawData && !isAuthOrQuota) {
                         onDiagnostic("@gradio/client stream error before data, falling back to native SSE: $msg")
-                        return false
+                        return JsAttemptOutcome.FALLBACK_TO_NATIVE
                     }
                     handleJobFailure(
-                        jobId, manifest, endpoint, startedAt, declaredGpuSec,
+                        recordJobId, manifest, endpoint, startedAt, declaredGpuSec,
                         error = msg,
-                        isQuota = msg.contains("quota", true) || msg.contains("zerogpu", true),
+                        isQuota = isQuotaOrHigherUsageError(msg),
                         onDiagnostic = onDiagnostic
                     )
-                    return true
+                    return JsAttemptOutcome.FAILED
                 }
             }
         }
+    }
+
+    private fun isQuotaOrHigherUsageError(msg: String): Boolean {
+        val low = msg.lowercase()
+        return low.contains("quota") ||
+            low.contains("zerogpu") ||
+            low.contains("gpu duration") ||
+            low.contains("exceeded") ||
+            low.contains("higher usage") ||
+            low.contains("unauthenticated")
+    }
+
+    private fun isAuthError(msg: String): Boolean {
+        val low = msg.lowercase()
+        return low.contains("authenticate") ||
+            low.contains("higher usage") ||
+            low.contains("sign in") ||
+            low.contains("log in") ||
+            low.contains("login") ||
+            low.contains("unauthorized") ||
+            low.contains("401") ||
+            low.contains("403")
     }
 
     /**
@@ -520,6 +657,7 @@ class SpaceExecutionEngine(
         fields: List<ComponentField>,
         values: Map<String, FieldValue>,
         token: String?,
+        spaceJwt: String?,
         onDiagnostic: (String) -> Unit
     ): JSONArray {
         val arr = JSONArray()
@@ -527,13 +665,13 @@ class SpaceExecutionEngine(
             val value = values[field.id] ?: defaultValueForField(field)
             when (value) {
                 is FieldValue.MediaRef -> {
-                    val uploaded = uploadMediaRef(hostUrl, apiPrefix, value, token, onDiagnostic)
+                    val uploaded = uploadMediaRef(hostUrl, apiPrefix, value, token, spaceJwt, onDiagnostic)
                     arr.put(uploaded ?: JSONObject.NULL)
                 }
                 is FieldValue.Multimodal -> {
                     val fileObjects = JSONArray()
                     for (ref in value.files) {
-                        uploadMediaRef(hostUrl, apiPrefix, ref, token, onDiagnostic)?.let { fileObjects.put(it) }
+                        uploadMediaRef(hostUrl, apiPrefix, ref, token, spaceJwt, onDiagnostic)?.let { fileObjects.put(it) }
                     }
                     arr.put(JSONObject().apply {
                         put("text", value.text)
@@ -551,6 +689,7 @@ class SpaceExecutionEngine(
         apiPrefix: String,
         ref: FieldValue.MediaRef,
         token: String?,
+        spaceJwt: String?,
         onDiagnostic: (String) -> Unit
     ): JSONObject? {
         val localFile = resolveMediaFile(ref)
@@ -562,7 +701,8 @@ class SpaceExecutionEngine(
                 file = localFile,
                 fileName = ref.fileName,
                 mimeType = ref.mimeType,
-                token = token
+                token = token,
+                spaceJwt = spaceJwt
             )
             return res.getOrThrow()
         }
@@ -624,6 +764,7 @@ class SpaceExecutionEngine(
         spaceId: String,
         jobId: String,
         token: String?,
+        spaceJwt: String?,
         cacheMedia: Boolean
     ): List<OutputItem> {
         val result = mutableListOf<OutputItem>()
@@ -643,6 +784,7 @@ class SpaceExecutionEngine(
                     spaceId = spaceId,
                     jobId = jobId,
                     token = token,
+                    spaceJwt = spaceJwt,
                     cacheMedia = cacheMedia
                 )
             )
@@ -660,6 +802,7 @@ class SpaceExecutionEngine(
         spaceId: String,
         jobId: String,
         token: String?,
+        spaceJwt: String?,
         cacheMedia: Boolean
     ): OutputItem {
         if (raw == null || raw === JSONObject.NULL) {
@@ -674,7 +817,7 @@ class SpaceExecutionEngine(
                 val imgObj = if (entry is JSONObject && entry.has("image")) entry.opt("image") else entry
                 val caption = if (entry is JSONObject) entry.optString("caption", "Image ${g + 1}") else "Image ${g + 1}"
                 galleryItems.add(
-                    interpretSingleOutput(g, caption, ComponentKind.IMAGE, imgObj, hostUrl, apiPrefix, spaceId, jobId, token, cacheMedia)
+                    interpretSingleOutput(g, caption, ComponentKind.IMAGE, imgObj, hostUrl, apiPrefix, spaceId, jobId, token, spaceJwt, cacheMedia)
                 )
             }
             return OutputItem(index = index, label = label, kind = ComponentKind.GALLERY, galleryItems = galleryItems, rawJson = raw.toString())
@@ -722,6 +865,7 @@ class SpaceExecutionEngine(
             val pathField = mediaObj.optString("path", "")
             if (urlField.isNotBlank() || pathField.isNotBlank()) {
                 val resolvedUrl = resolveRemoteFileUrl(urlField, pathField, hostUrl, apiPrefix)
+                val downloadUrl = GradioNativeClient.appendSignParam(resolvedUrl, spaceJwt)
                 val fileName = mediaObj.optString("orig_name", "").ifBlank {
                     resolvedUrl.substringAfterLast('/').substringBefore('?').ifBlank { "output_$index" }
                 }
@@ -732,7 +876,7 @@ class SpaceExecutionEngine(
                 var assetId: String? = null
                 if (cacheMedia && resolvedUrl.startsWith("https://")) {
                     val cached = mediaLibraryManager.cacheRemoteMedia(
-                        remoteUrl = resolvedUrl,
+                        remoteUrl = downloadUrl,
                         spaceId = spaceId,
                         jobId = jobId,
                         fileNameHint = fileName,
@@ -768,7 +912,8 @@ class SpaceExecutionEngine(
             var cachedPath: String? = null
             var assetId: String? = null
             if (cacheMedia) {
-                mediaLibraryManager.cacheRemoteMedia(str, spaceId, jobId, fileName, mime, token).getOrNull()?.let {
+                val downloadUrl = GradioNativeClient.appendSignParam(str, spaceJwt)
+                mediaLibraryManager.cacheRemoteMedia(downloadUrl, spaceId, jobId, fileName, mime, token).getOrNull()?.let {
                     cachedPath = it.localFilePath
                     assetId = it.id
                 }
@@ -847,9 +992,9 @@ class SpaceExecutionEngine(
     ) {
         val now = System.currentTimeMillis()
         val friendlyError = when {
-            isQuota -> "ZeroGPU quota limit reached or requested GPU duration exceeded. Sign in with a Hugging Face account (or PRO) in Vault, or retry after quota resets.\nDetails: $error"
+            isQuota -> "ZeroGPU quota limit or higher-usage authentication required. Verify your Hugging Face Access Token or Sign in with HF OAuth in Vault, or retry after quota resets.\nDetails: $error"
             error.contains("503") || error.contains("sleeping", true) -> "Space is waking up or paused. Give it a moment, or open Full Space View to trigger startup."
-            error.contains("401") || error.contains("403") -> "Authentication error. Check your Hugging Face token in Vault or per-Space auth settings."
+            error.contains("401") || error.contains("403") -> "Authentication error. Check your Hugging Face Access Token or OAuth sign-in in Vault."
             else -> error
         }
         _activeJob.update {

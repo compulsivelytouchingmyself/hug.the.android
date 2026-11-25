@@ -119,7 +119,11 @@ fun SpaceDeckApp(viewModel: SpaceDeckViewModel) {
     val accountInfo by viewModel.accountInfo.collectAsStateWithLifecycle()
     val isAnonymousMode by viewModel.isAnonymousMode.collectAsStateWithLifecycle()
     val hasDefaultToken by viewModel.hasDefaultToken.collectAsStateWithLifecycle()
+    val hasOAuthToken by viewModel.hasOAuthToken.collectAsStateWithLifecycle()
+    val oauthClientId by viewModel.oauthClientId.collectAsStateWithLifecycle()
+    val authStrategy by viewModel.authStrategy.collectAsStateWithLifecycle()
     val isVerifyingToken by viewModel.isVerifyingToken.collectAsStateWithLifecycle()
+    val isOAuthInProgress by viewModel.isOAuthInProgress.collectAsStateWithLifecycle()
     val tokenError by viewModel.tokenError.collectAsStateWithLifecycle()
     val perSpaceAuthModes by viewModel.perSpaceAuthModes.collectAsStateWithLifecycle()
     val diagnostics by viewModel.diagnostics.collectAsStateWithLifecycle()
@@ -240,6 +244,7 @@ fun SpaceDeckApp(viewModel: SpaceDeckViewModel) {
                             onApplyManualManifest = viewModel::applyManualManifestOverride,
                             onResetManualOverride = viewModel::resetManualOverride,
                             onSetSpaceAuth = viewModel::setSpaceAuthPreference,
+                            onOpenVault = { navigateAction("vault") },
                             onShowMessage = viewModel::showMessage
                         )
                     }
@@ -260,18 +265,26 @@ fun SpaceDeckApp(viewModel: SpaceDeckViewModel) {
                         VaultScreen(
                             accountInfo = accountInfo,
                             hasDefaultToken = hasDefaultToken,
+                            hasOAuthToken = hasOAuthToken,
+                            oauthClientId = oauthClientId,
+                            authStrategy = authStrategy,
                             isAnonymousMode = isAnonymousMode,
                             isVerifyingToken = isVerifyingToken,
+                            isOAuthInProgress = isOAuthInProgress,
                             tokenError = tokenError,
                             perSpaceAuthModes = perSpaceAuthModes,
                             jobHistory = jobHistory,
                             sdkVersionsLabel = viewModel.sdkVersionsLabel,
                             onSaveAndVerifyToken = viewModel::saveAndVerifyToken,
                             onClearToken = viewModel::clearDefaultToken,
+                            onStartOAuth = viewModel::startHfOAuthSignIn,
+                            onClearOAuth = viewModel::clearOAuthToken,
+                            onSetAuthStrategy = viewModel::setAuthStrategy,
                             onSetAnonymousMode = viewModel::setAnonymousMode,
                             onResetSpaceAuth = { id -> viewModel.setSpaceAuthPreference(id, SpaceAuthMode.DEFAULT_ACCOUNT, null) },
                             onOpenSpace = { id -> viewModel.openSpace(id) },
-                            onDeleteJob = viewModel::deleteJobRecord
+                            onDeleteJob = viewModel::deleteJobRecord,
+                            onCopyMessage = viewModel::showMessage
                         )
                     }
                 }

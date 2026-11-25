@@ -17,6 +17,7 @@ import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
+import java.net.URLEncoder
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
@@ -37,7 +38,11 @@ sealed class NativeStreamEvent {
     ) : NativeStreamEvent()
     data class Generating(val data: JSONArray, val message: String = "Streaming output…") : NativeStreamEvent()
     data class Completed(val data: JSONArray, val durationSeconds: Double? = null) : NativeStreamEvent()
-    data class Error(val message: String, val isQuotaError: Boolean = false) : NativeStreamEvent()
+    data class Error(
+        val message: String,
+        val isQuotaError: Boolean = false,
+        val isAuthError: Boolean = false
+    ) : NativeStreamEvent()
 }
 
 /**
@@ -55,24 +60,43 @@ class GradioNativeClient(
         .build()
 ) {
 
-    private fun buildRequest(url: String, token: String?): Request.Builder {
+    companion object {
+        /**
+         * Appends ?__sign=<jwt> or &__sign=<jwt> ONLY to trusted Hugging Face hosts.
+         */
+        fun appendSignParam(url: String, spaceJwt: String?): String {
+            if (spaceJwt.isNullOrBlank()) return url
+            if (!AllowedHosts.isTrustedForCredentials(url)) return url
+            if (url.contains("__sign=")) return url
+            val encoded = URLEncoder.encode(spaceJwt, "UTF-8")
+            val sep = if (url.contains("?")) "&" else "?"
+            return "$url${sep}__sign=$encoded"
+        }
+    }
+
+    private fun buildRequest(url: String, token: String?, spaceJwt: String? = null): Request.Builder {
+        val signedUrl = appendSignParam(url, spaceJwt)
         val builder = Request.Builder()
-            .url(url)
+            .url(signedUrl)
             .header("User-Agent", "SpaceDeck-Android/1.0")
-        if (!token.isNullOrBlank() && AllowedHosts.isTrustedForCredentials(url)) {
+        if (!token.isNullOrBlank() && AllowedHosts.isTrustedForCredentials(signedUrl)) {
             builder.header("Authorization", "Bearer $token")
         }
         return builder
     }
 
-    suspend fun fetchRuntimeBundle(hostUrl: String, token: String?): GradioRuntimeBundle = withContext(Dispatchers.IO) {
+    suspend fun fetchRuntimeBundle(
+        hostUrl: String,
+        token: String?,
+        spaceJwt: String? = null
+    ): GradioRuntimeBundle = withContext(Dispatchers.IO) {
         val base = hostUrl.trimEnd('/')
         var configJson: JSONObject? = null
         var apiPrefix = ""
 
         // Probe /config first (Gradio 4/5 both serve /config, Gradio 5 includes api_prefix="/gradio_api")
         for (candidate in listOf("$base/config", "$base/gradio_api/config")) {
-            val res = getJson(candidate, token)
+            val res = getJson(candidate, token, spaceJwt)
             if (res != null && (res.has("components") || res.has("version") || res.has("dependencies"))) {
                 configJson = res
                 apiPrefix = res.optString("api_prefix", if (candidate.contains("/gradio_api/")) "/gradio_api" else "")
@@ -94,7 +118,7 @@ class GradioNativeClient(
 
         var apiInfoJson: JSONObject? = null
         for (candidate in infoCandidates) {
-            val res = getJson(candidate, token)
+            val res = getJson(candidate, token, spaceJwt)
             if (res != null && (res.has("named_endpoints") || res.has("unnamed_endpoints"))) {
                 apiInfoJson = res
                 if (candidate.contains("/gradio_api/") && apiPrefix.isBlank()) {
@@ -118,7 +142,8 @@ class GradioNativeClient(
         file: File,
         fileName: String,
         mimeType: String,
-        token: String?
+        token: String?,
+        spaceJwt: String? = null
     ): Result<JSONObject> = withContext(Dispatchers.IO) {
         runCatching {
             val base = hostUrl.trimEnd('/')
@@ -140,7 +165,7 @@ class GradioNativeClient(
                     )
                     .build()
 
-                val req = buildRequest(url, token)
+                val req = buildRequest(url, token, spaceJwt)
                     .post(multipart)
                     .build()
 
@@ -182,6 +207,7 @@ class GradioNativeClient(
         dataArray: JSONArray,
         sessionHash: String,
         token: String?,
+        spaceJwt: String? = null,
         onEvent: suspend (NativeStreamEvent) -> Unit
     ) = withContext(Dispatchers.IO) {
         val base = hostUrl.trimEnd('/')
@@ -197,7 +223,7 @@ class GradioNativeClient(
 
             for (callUrl in callUrls) {
                 val payload = JSONObject().put("data", dataArray).toString()
-                val postReq = buildRequest(callUrl, token)
+                val postReq = buildRequest(callUrl, token, spaceJwt)
                     .post(payload.toRequestBody("application/json".toMediaTypeOrNull()))
                     .build()
 
@@ -207,7 +233,13 @@ class GradioNativeClient(
                         if (resp.isSuccessful) {
                             runCatching { JSONObject(body).optString("event_id") }.getOrNull()
                         } else if (resp.code == 401 || resp.code == 403) {
-                            onEvent(NativeStreamEvent.Error("Authentication required (HTTP ${resp.code}). Configure your Hugging Face token in Vault."))
+                            onEvent(
+                                NativeStreamEvent.Error(
+                                    message = "Authentication required (HTTP ${resp.code}). Configure your Hugging Face token or OAuth sign-in in Vault.",
+                                    isQuotaError = false,
+                                    isAuthError = true
+                                )
+                            )
                             return@withContext
                         } else if (resp.code == 503) {
                             onEvent(NativeStreamEvent.Error("Space is sleeping or starting up (HTTP 503). Wait a moment and retry."))
@@ -219,7 +251,7 @@ class GradioNativeClient(
                 }
 
                 if (!eventId.isNullOrBlank()) {
-                    streamCallSse("$callUrl/$eventId", token, onEvent)
+                    streamCallSse("$callUrl/$eventId", token, spaceJwt, onEvent)
                     return@withContext
                 }
             }
@@ -235,17 +267,27 @@ class GradioNativeClient(
                     put("fn_index", fnIndex)
                     put("session_hash", sessionHash)
                 }.toString()
-                val req = buildRequest(joinUrl, token)
+                val req = buildRequest(joinUrl, token, spaceJwt)
                     .post(joinBody.toRequestBody("application/json".toMediaTypeOrNull()))
                     .build()
-                val joined = try {
-                    okHttpClient.newCall(req).execute().use { it.isSuccessful }
+                val joinStatus = try {
+                    okHttpClient.newCall(req).execute().use { resp -> resp.code }
                 } catch (_: Exception) {
-                    false
+                    -1
                 }
-                if (joined) {
+                if (joinStatus == 401 || joinStatus == 403) {
+                    onEvent(
+                        NativeStreamEvent.Error(
+                            message = "Authentication required for queue join (HTTP $joinStatus).",
+                            isQuotaError = false,
+                            isAuthError = true
+                        )
+                    )
+                    return@withContext
+                }
+                if (joinStatus in 200..299) {
                     val dataUrl = joinUrl.replace("/queue/join", "/queue/data?session_hash=$sessionHash")
-                    streamQueueDataSse(dataUrl, token, onEvent)
+                    streamQueueDataSse(dataUrl, token, spaceJwt, onEvent)
                     return@withContext
                 }
             }
@@ -258,7 +300,7 @@ class GradioNativeClient(
             if (fnIndex != null) put("fn_index", fnIndex)
             put("session_hash", sessionHash)
         }.toString()
-        val req = buildRequest(predictUrl, token)
+        val req = buildRequest(predictUrl, token, spaceJwt)
             .post(predictBody.toRequestBody("application/json".toMediaTypeOrNull()))
             .build()
         try {
@@ -266,7 +308,13 @@ class GradioNativeClient(
                 val body = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
                     val sanitized = TokenRedactor.sanitize(body.take(220))
-                    onEvent(NativeStreamEvent.Error("Remote Space returned HTTP ${resp.code}: $sanitized", isQuotaError = isQuotaHint(sanitized)))
+                    onEvent(
+                        NativeStreamEvent.Error(
+                            message = "Remote Space returned HTTP ${resp.code}: $sanitized",
+                            isQuotaError = isQuotaHint(sanitized),
+                            isAuthError = resp.code == 401 || resp.code == 403 || isAuthHint(sanitized)
+                        )
+                    )
                     return@withContext
                 }
                 val json = JSONObject(body)
@@ -279,7 +327,13 @@ class GradioNativeClient(
         }
     }
 
-    suspend fun cancelSession(hostUrl: String, apiPrefix: String, sessionHash: String, token: String?) = withContext(Dispatchers.IO) {
+    suspend fun cancelSession(
+        hostUrl: String,
+        apiPrefix: String,
+        sessionHash: String,
+        token: String?,
+        spaceJwt: String? = null
+    ) = withContext(Dispatchers.IO) {
         val base = hostUrl.trimEnd('/')
         val candidates = buildList {
             if (apiPrefix.isNotBlank()) add("$base$apiPrefix/cancel")
@@ -289,7 +343,7 @@ class GradioNativeClient(
         val body = JSONObject().put("session_hash", sessionHash).toString()
         for (url in candidates) {
             runCatching {
-                val req = buildRequest(url, token)
+                val req = buildRequest(url, token, spaceJwt)
                     .post(body.toRequestBody("application/json".toMediaTypeOrNull()))
                     .build()
                 okHttpClient.newCall(req).execute().close()
@@ -300,9 +354,10 @@ class GradioNativeClient(
     private suspend fun streamCallSse(
         sseUrl: String,
         token: String?,
+        spaceJwt: String?,
         onEvent: suspend (NativeStreamEvent) -> Unit
     ) {
-        val req = buildRequest(sseUrl, token)
+        val req = buildRequest(sseUrl, token, spaceJwt)
             .header("Accept", "text/event-stream")
             .get()
             .build()
@@ -311,7 +366,13 @@ class GradioNativeClient(
                 if (!resp.isSuccessful) {
                     val body = resp.body?.string().orEmpty()
                     val msg = TokenRedactor.sanitize(body.take(220))
-                    onEvent(NativeStreamEvent.Error("Stream failed (HTTP ${resp.code}): $msg", isQuotaError = isQuotaHint(msg)))
+                    onEvent(
+                        NativeStreamEvent.Error(
+                            message = "Stream failed (HTTP ${resp.code}): $msg",
+                            isQuotaError = isQuotaHint(msg),
+                            isAuthError = resp.code == 401 || resp.code == 403 || isAuthHint(msg)
+                        )
+                    )
                     return
                 }
                 val stream = resp.body?.byteStream() ?: return
@@ -336,7 +397,13 @@ class GradioNativeClient(
                                 }
                                 "error" -> {
                                     val clean = parseErrorMessage(dataStr)
-                                    onEvent(NativeStreamEvent.Error(clean, isQuotaError = isQuotaHint(clean)))
+                                    onEvent(
+                                        NativeStreamEvent.Error(
+                                            message = clean,
+                                            isQuotaError = isQuotaHint(clean),
+                                            isAuthError = isAuthHint(clean)
+                                        )
+                                    )
                                     return
                                 }
                                 "heartbeat" -> {
@@ -357,16 +424,22 @@ class GradioNativeClient(
     private suspend fun streamQueueDataSse(
         sseUrl: String,
         token: String?,
+        spaceJwt: String?,
         onEvent: suspend (NativeStreamEvent) -> Unit
     ) {
-        val req = buildRequest(sseUrl, token)
+        val req = buildRequest(sseUrl, token, spaceJwt)
             .header("Accept", "text/event-stream")
             .get()
             .build()
         try {
             okHttpClient.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) {
-                    onEvent(NativeStreamEvent.Error("Queue stream error (HTTP ${resp.code})"))
+                    onEvent(
+                        NativeStreamEvent.Error(
+                            message = "Queue stream error (HTTP ${resp.code})",
+                            isAuthError = resp.code == 401 || resp.code == 403
+                        )
+                    )
                     return
                 }
                 val stream = resp.body?.byteStream() ?: return
@@ -419,7 +492,13 @@ class GradioNativeClient(
                                 val err = TokenRedactor.sanitize(
                                     outObj.optString("error", json.optString("title", "Execution failed on Space"))
                                 )
-                                onEvent(NativeStreamEvent.Error(err, isQuotaError = isQuotaHint(err)))
+                                onEvent(
+                                    NativeStreamEvent.Error(
+                                        message = err,
+                                        isQuotaError = isQuotaHint(err),
+                                        isAuthError = isAuthHint(err)
+                                    )
+                                )
                             }
                             return
                         }
@@ -437,9 +516,9 @@ class GradioNativeClient(
         }
     }
 
-    private fun getJson(url: String, token: String?): JSONObject? {
+    private fun getJson(url: String, token: String?, spaceJwt: String? = null): JSONObject? {
         return try {
-            val req = buildRequest(url, token)
+            val req = buildRequest(url, token, spaceJwt)
                 .header("Accept", "application/json")
                 .get()
                 .build()
@@ -467,6 +546,23 @@ class GradioNativeClient(
 
     private fun isQuotaHint(msg: String): Boolean {
         val low = msg.lowercase()
-        return low.contains("quota") || low.contains("zerogpu") || low.contains("gpu duration") || low.contains("exceeded")
+        return low.contains("quota") ||
+            low.contains("zerogpu") ||
+            low.contains("gpu duration") ||
+            low.contains("exceeded") ||
+            low.contains("higher usage") ||
+            low.contains("unauthenticated")
+    }
+
+    private fun isAuthHint(msg: String): Boolean {
+        val low = msg.lowercase()
+        return low.contains("authenticate") ||
+            low.contains("higher usage") ||
+            low.contains("sign in") ||
+            low.contains("log in") ||
+            low.contains("login") ||
+            low.contains("unauthorized") ||
+            low.contains("401") ||
+            low.contains("403")
     }
 }

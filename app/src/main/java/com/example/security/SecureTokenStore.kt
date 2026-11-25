@@ -6,6 +6,7 @@ import android.security.keystore.KeyProperties
 import android.util.Base64
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.model.AccountInfo
@@ -24,6 +25,23 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
 private val Context.secureAuthDataStore by preferencesDataStore(name = "spacedeck_secure_vault")
+
+enum class AuthCredentialSource(val label: String) {
+    PERSONAL_TOKEN("Access Token"),
+    OAUTH_PKCE("HF OAuth"),
+    SPACE_CUSTOM_TOKEN("Space Token"),
+    ANONYMOUS("Anonymous")
+}
+
+enum class AuthStrategy(val label: String) {
+    TOKEN_THEN_OAUTH("Token → OAuth fallback"),
+    OAUTH_THEN_TOKEN("OAuth → Token fallback")
+}
+
+data class ResolvedCredential(
+    val token: String,
+    val source: AuthCredentialSource
+)
 
 object AllowedHosts {
     fun isTrustedForCredentials(urlString: String): Boolean {
@@ -47,7 +65,6 @@ object AllowedHosts {
             val scheme = uri.scheme?.lowercase() ?: return false
             if (scheme != "https") return false
             val host = uri.host?.lowercase() ?: return false
-            // Block loopback, private, and link-local ranges
             if (host == "localhost" || host == "127.0.0.1" || host == "0.0.0.0" ||
                 host.startsWith("10.") || host.startsWith("192.168.") ||
                 host.startsWith("169.254.") || host.startsWith("172.") ||
@@ -68,11 +85,15 @@ object AllowedHosts {
 object TokenRedactor {
     private val hfTokenRegex = Regex("""hf_[A-Za-z0-9]{10,}""")
     private val bearerRegex = Regex("""(?i)(Bearer\s+)[A-Za-z0-9._\-]+""")
+    private val signQueryRegex = Regex("""(__sign=)[^&\s"']+""")
+    private val jwtRegex = Regex("""eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}""")
 
     fun sanitize(input: String): String {
         return input
             .replace(hfTokenRegex, "hf_[REDACTED]")
             .replace(bearerRegex, "$1[REDACTED]")
+            .replace(signQueryRegex, "$1[REDACTED]")
+            .replace(jwtRegex, "[JWT_REDACTED]")
     }
 }
 
@@ -85,6 +106,10 @@ class SecureTokenStore(private val context: Context) {
         private const val GCM_TAG_BITS = 128
 
         private val KEY_DEFAULT_TOKEN_ENC = stringPreferencesKey("default_token_enc")
+        private val KEY_OAUTH_TOKEN_ENC = stringPreferencesKey("oauth_token_enc")
+        private val KEY_OAUTH_EXPIRES_AT = longPreferencesKey("oauth_expires_at")
+        private val KEY_OAUTH_CLIENT_ID = stringPreferencesKey("oauth_client_id")
+        private val KEY_AUTH_STRATEGY = stringPreferencesKey("auth_strategy")
         private val KEY_ANONYMOUS_MODE = booleanPreferencesKey("anonymous_mode")
         private val KEY_ACCOUNT_INFO = stringPreferencesKey("account_info_json")
         private val KEY_PER_SPACE_AUTH = stringPreferencesKey("per_space_auth_enc")
@@ -144,6 +169,20 @@ class SecureTokenStore(private val context: Context) {
         !prefs[KEY_DEFAULT_TOKEN_ENC].isNullOrBlank()
     }
 
+    val hasOAuthToken: Flow<Boolean> = context.secureAuthDataStore.data.map { prefs ->
+        !prefs[KEY_OAUTH_TOKEN_ENC].isNullOrBlank()
+    }
+
+    val oauthClientIdFlow: Flow<String> = context.secureAuthDataStore.data.map { prefs ->
+        prefs[KEY_OAUTH_CLIENT_ID].orEmpty()
+    }
+
+    val authStrategyFlow: Flow<AuthStrategy> = context.secureAuthDataStore.data.map { prefs ->
+        runCatching {
+            AuthStrategy.valueOf(prefs[KEY_AUTH_STRATEGY] ?: AuthStrategy.TOKEN_THEN_OAUTH.name)
+        }.getOrDefault(AuthStrategy.TOKEN_THEN_OAUTH)
+    }
+
     val accountInfoFlow: Flow<AccountInfo?> = context.secureAuthDataStore.data.map { prefs ->
         prefs[KEY_ACCOUNT_INFO]?.let { decodeAccountInfo(it) }
     }
@@ -161,16 +200,53 @@ class SecureTokenStore(private val context: Context) {
         }
     }
 
-    suspend fun getDefaultToken(): String? {
-        val prefs = context.secureAuthDataStore.data.first()
-        val enc = prefs[KEY_DEFAULT_TOKEN_ENC] ?: return null
-        return decrypt(enc)
+    suspend fun saveOAuthToken(accessToken: String, expiresInSeconds: Long? = null) {
+        val cleaned = accessToken.trim()
+        if (cleaned.isEmpty()) {
+            clearOAuthToken()
+            return
+        }
+        val encrypted = encrypt(cleaned)
+        val expiresAt = expiresInSeconds?.let { System.currentTimeMillis() + it * 1000L } ?: 0L
+        context.secureAuthDataStore.edit { prefs ->
+            prefs[KEY_OAUTH_TOKEN_ENC] = encrypted
+            prefs[KEY_OAUTH_EXPIRES_AT] = expiresAt
+            prefs[KEY_ANONYMOUS_MODE] = false
+        }
+    }
+
+    suspend fun saveOAuthClientId(clientId: String) {
+        context.secureAuthDataStore.edit { prefs ->
+            prefs[KEY_OAUTH_CLIENT_ID] = clientId.trim()
+        }
+    }
+
+    suspend fun getOAuthClientId(): String {
+        return context.secureAuthDataStore.data.first()[KEY_OAUTH_CLIENT_ID].orEmpty()
+    }
+
+    suspend fun setAuthStrategy(strategy: AuthStrategy) {
+        context.secureAuthDataStore.edit { prefs ->
+            prefs[KEY_AUTH_STRATEGY] = strategy.name
+        }
     }
 
     suspend fun clearDefaultToken() {
         context.secureAuthDataStore.edit { prefs ->
             prefs.remove(KEY_DEFAULT_TOKEN_ENC)
-            prefs.remove(KEY_ACCOUNT_INFO)
+            if (prefs[KEY_OAUTH_TOKEN_ENC].isNullOrBlank()) {
+                prefs.remove(KEY_ACCOUNT_INFO)
+            }
+        }
+    }
+
+    suspend fun clearOAuthToken() {
+        context.secureAuthDataStore.edit { prefs ->
+            prefs.remove(KEY_OAUTH_TOKEN_ENC)
+            prefs.remove(KEY_OAUTH_EXPIRES_AT)
+            if (prefs[KEY_DEFAULT_TOKEN_ENC].isNullOrBlank()) {
+                prefs.remove(KEY_ACCOUNT_INFO)
+            }
         }
     }
 
@@ -230,9 +306,13 @@ class SecureTokenStore(private val context: Context) {
         return result
     }
 
-    suspend fun resolveTokenForSpace(spaceId: String?, targetUrl: String? = null): String? {
+    /**
+     * Returns an ordered list of valid credentials to attempt for a Space,
+     * supporting dual-path authentication (Personal Access Token + OAuth PKCE fallback).
+     */
+    suspend fun resolveCredentialChainForSpace(spaceId: String?, targetUrl: String? = null): List<ResolvedCredential> {
         if (targetUrl != null && !AllowedHosts.isTrustedForCredentials(targetUrl)) {
-            return null
+            return emptyList()
         }
         if (spaceId != null) {
             val map = loadPerSpaceAuthMap()
@@ -241,16 +321,44 @@ class SecureTokenStore(private val context: Context) {
                 val mode = runCatching { SpaceAuthMode.valueOf(entry.optString("mode")) }
                     .getOrDefault(SpaceAuthMode.DEFAULT_ACCOUNT)
                 when (mode) {
-                    SpaceAuthMode.ANONYMOUS -> return null
-                    SpaceAuthMode.CUSTOM_TOKEN -> return entry.optString("token").takeIf { it.isNotBlank() }
+                    SpaceAuthMode.ANONYMOUS -> return emptyList()
+                    SpaceAuthMode.CUSTOM_TOKEN -> {
+                        val custom = entry.optString("token").takeIf { it.isNotBlank() }
+                        return if (custom != null) listOf(ResolvedCredential(custom, AuthCredentialSource.SPACE_CUSTOM_TOKEN)) else emptyList()
+                    }
                     SpaceAuthMode.DEFAULT_ACCOUNT -> Unit
                 }
             }
         }
+
         val prefs = context.secureAuthDataStore.data.first()
-        if (prefs[KEY_ANONYMOUS_MODE] == true) return null
-        val enc = prefs[KEY_DEFAULT_TOKEN_ENC] ?: return null
-        return decrypt(enc)
+        if (prefs[KEY_ANONYMOUS_MODE] == true) return emptyList()
+
+        val pat = prefs[KEY_DEFAULT_TOKEN_ENC]?.let { decrypt(it) }?.takeIf { it.isNotBlank() }
+        val oauthRaw = prefs[KEY_OAUTH_TOKEN_ENC]?.let { decrypt(it) }?.takeIf { it.isNotBlank() }
+        val expiresAt = prefs[KEY_OAUTH_EXPIRES_AT] ?: 0L
+        val oauthValid = oauthRaw?.takeIf { expiresAt == 0L || System.currentTimeMillis() < expiresAt }
+
+        val strategy = runCatching {
+            AuthStrategy.valueOf(prefs[KEY_AUTH_STRATEGY] ?: AuthStrategy.TOKEN_THEN_OAUTH.name)
+        }.getOrDefault(AuthStrategy.TOKEN_THEN_OAUTH)
+
+        return buildList {
+            when (strategy) {
+                AuthStrategy.TOKEN_THEN_OAUTH -> {
+                    if (pat != null) add(ResolvedCredential(pat, AuthCredentialSource.PERSONAL_TOKEN))
+                    if (oauthValid != null) add(ResolvedCredential(oauthValid, AuthCredentialSource.OAUTH_PKCE))
+                }
+                AuthStrategy.OAUTH_THEN_TOKEN -> {
+                    if (oauthValid != null) add(ResolvedCredential(oauthValid, AuthCredentialSource.OAUTH_PKCE))
+                    if (pat != null) add(ResolvedCredential(pat, AuthCredentialSource.PERSONAL_TOKEN))
+                }
+            }
+        }
+    }
+
+    suspend fun resolveTokenForSpace(spaceId: String?, targetUrl: String? = null): String? {
+        return resolveCredentialChainForSpace(spaceId, targetUrl).firstOrNull()?.token
     }
 
     private suspend fun loadPerSpaceAuthMap(): JSONObject {

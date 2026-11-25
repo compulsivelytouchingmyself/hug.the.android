@@ -141,9 +141,14 @@ class HybridSdkBridge(
         timeoutMs = 20_000L
     )
 
-    suspend fun connectAndInspect(sessionKey: String, spaceRef: String, token: String?): Result<JSONObject> = invokeSdk(
+    suspend fun connectAndInspect(
+        sessionKey: String,
+        spaceRef: String,
+        token: String?,
+        spaceJwt: String? = null
+    ): Result<JSONObject> = invokeSdk(
         jsCall = { callId ->
-            "window.SpaceDeckSdk.connectAndInspect(${JSONObject.quote(callId)}, ${JSONObject.quote(sessionKey)}, ${JSONObject.quote(spaceRef)}, ${quoteNullable(token)});"
+            "window.SpaceDeckSdk.connectAndInspect(${JSONObject.quote(callId)}, ${JSONObject.quote(sessionKey)}, ${JSONObject.quote(spaceRef)}, ${quoteNullable(token)}, ${quoteNullable(spaceJwt)});"
         },
         timeoutMs = 25_000L
     )
@@ -153,11 +158,12 @@ class HybridSdkBridge(
         sessionKey: String,
         spaceRef: String,
         token: String?,
+        spaceJwt: String? = null,
         endpoint: String,
         rawArgsJson: String
     ): Result<JSONObject> = invokeSdk(
         jsCall = { callId ->
-            "window.SpaceDeckSdk.submitJob(${JSONObject.quote(callId)}, ${JSONObject.quote(jobId)}, ${JSONObject.quote(sessionKey)}, ${JSONObject.quote(spaceRef)}, ${quoteNullable(token)}, ${JSONObject.quote(endpoint)}, ${JSONObject.quote(rawArgsJson)});"
+            "window.SpaceDeckSdk.submitJob(${JSONObject.quote(callId)}, ${JSONObject.quote(jobId)}, ${JSONObject.quote(sessionKey)}, ${JSONObject.quote(spaceRef)}, ${quoteNullable(token)}, ${quoteNullable(spaceJwt)}, ${JSONObject.quote(endpoint)}, ${JSONObject.quote(rawArgsJson)});"
         },
         timeoutMs = 30_000L
     )
@@ -173,6 +179,13 @@ class HybridSdkBridge(
         val wv = webView ?: return
         mainHandler.post {
             wv.evaluateJavascript("window.SpaceDeckSdk && window.SpaceDeckSdk.closeSession(${JSONObject.quote(sessionKey)});", null)
+        }
+    }
+
+    fun clearAllSessions() {
+        val wv = webView ?: return
+        mainHandler.post {
+            wv.evaluateJavascript("window.SpaceDeckSdk && window.SpaceDeckSdk.clearAllSessions();", null)
         }
     }
 

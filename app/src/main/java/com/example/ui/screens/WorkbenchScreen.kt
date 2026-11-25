@@ -162,6 +162,7 @@ fun WorkbenchScreen(
     onApplyManualManifest: (String) -> Unit,
     onResetManualOverride: () -> Unit,
     onSetSpaceAuth: (String, SpaceAuthMode, String?) -> Unit,
+    onOpenVault: () -> Unit,
     onShowMessage: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -403,7 +404,7 @@ fun WorkbenchScreen(
             // Live Job Status Card (always visible on Controls/Outputs when active or completed/failed)
             if (activeJob.status != JobStatus.IDLE && state.subTab != WorkbenchSubTab.FULL_SPACE) {
                 item {
-                    LiveJobStatusCard(job = activeJob)
+                    LiveJobStatusCard(job = activeJob, onOpenVault = onOpenVault)
                 }
             }
 
@@ -1065,7 +1066,10 @@ fun WorkbenchScreen(
 }
 
 @Composable
-private fun LiveJobStatusCard(job: ActiveJobState) {
+private fun LiveJobStatusCard(
+    job: ActiveJobState,
+    onOpenVault: () -> Unit
+) {
     val accent = when (job.status) {
         JobStatus.COMPLETED -> StatusEmerald
         JobStatus.FAILED -> StatusCrimson
@@ -1133,6 +1137,24 @@ private fun LiveJobStatusCard(job: ActiveJobState) {
                     style = MaterialTheme.typography.bodySmall,
                     color = StatusCrimson
                 )
+                val errLower = job.errorMessage.lowercase()
+                if (errLower.contains("quota") ||
+                    errLower.contains("authenticate") ||
+                    errLower.contains("higher usage") ||
+                    errLower.contains("oauth") ||
+                    errLower.contains("vault") ||
+                    errLower.contains("401") ||
+                    errLower.contains("403")
+                ) {
+                    OutlinedButton(
+                        onClick = onOpenVault,
+                        modifier = Modifier.minimumInteractiveComponentSize().testTag("error_open_vault_button")
+                    ) {
+                        Icon(Icons.Default.Key, contentDescription = null, modifier = Modifier.size(16.dp), tint = SignalAmber)
+                        Spacer(Modifier.width(6.dp))
+                        Text("Configure Token / HF OAuth in Vault", color = SignalAmber, style = MaterialTheme.typography.labelMedium)
+                    }
+                }
             }
         }
     }

@@ -89,6 +89,44 @@ class HfHubClient(
         }
     }
 
+    /**
+     * Exchanges the user's HF access token or OAuth token for a Space-scoped signed JWT
+     * required by ZeroGPU and private Spaces (?__sign=<jwt>).
+     */
+    suspend fun fetchSpaceJwt(spaceId: String, token: String): Result<String> = withContext(Dispatchers.IO) {
+        runCatching {
+            val cleanSpaceId = spaceId.trim().trim('/')
+            require(cleanSpaceId.contains("/")) { "Invalid Space ID for JWT exchange." }
+            val url = "https://huggingface.co/api/spaces/$cleanSpaceId/jwt"
+            val req = buildAuthorizedRequest(url, token)
+            okHttpClient.newCall(req).execute().use { resp ->
+                val body = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    throw IllegalStateException("Space JWT exchange failed (HTTP ${resp.code}): ${TokenRedactor.sanitize(body.take(140))}")
+                }
+                val jwt = JSONObject(body).optString("token", "").trim()
+                if (jwt.isBlank()) {
+                    throw IllegalStateException("Space JWT response did not contain a token.")
+                }
+                jwt
+            }
+        }
+    }
+
+    suspend fun fetchZeroGpuQuota(token: String): Result<String> = withContext(Dispatchers.IO) {
+        runCatching {
+            val url = "https://huggingface.co/api/spaces/zero-gpu/quota"
+            val req = buildAuthorizedRequest(url, token)
+            okHttpClient.newCall(req).execute().use { resp ->
+                val body = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    throw IllegalStateException("ZeroGPU quota lookup failed (HTTP ${resp.code})")
+                }
+                body
+            }
+        }
+    }
+
     suspend fun searchSpaces(
         query: String = "",
         sort: String = "trendingScore",

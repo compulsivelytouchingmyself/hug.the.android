@@ -8,6 +8,7 @@ import com.example.network.HfHubClient
 import com.example.network.HybridSdkBridge
 import com.example.network.SpaceDiscoveryEngine
 import com.example.network.SpaceExecutionEngine
+import com.example.security.HfOAuthManager
 import com.example.security.SecureTokenStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -18,6 +19,7 @@ class SpaceDeckContainer(application: Application) {
     val database: SpaceDeckDatabase = SpaceDeckDatabase.getInstance(application)
     val tokenStore: SecureTokenStore = SecureTokenStore(application)
     val hubClient: HfHubClient = HfHubClient()
+    val oauthManager: HfOAuthManager = HfOAuthManager(application, hubClient.okHttpClient)
     val gradioNativeClient: GradioNativeClient = GradioNativeClient()
     val hybridSdkBridge: HybridSdkBridge = HybridSdkBridge(application, hubClient.okHttpClient)
     val mediaLibraryManager: MediaLibraryManager = MediaLibraryManager(
@@ -33,6 +35,7 @@ class SpaceDeckContainer(application: Application) {
     )
     val executionEngine: SpaceExecutionEngine = SpaceExecutionEngine(
         context = application,
+        hubClient = hubClient,
         hybridSdkBridge = hybridSdkBridge,
         gradioNativeClient = gradioNativeClient,
         mediaLibraryManager = mediaLibraryManager,

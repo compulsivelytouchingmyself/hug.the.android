@@ -35,6 +35,7 @@ import com.example.model.SpaceProfile
 import com.example.model.SpaceSummary
 import com.example.network.SpaceExecutionEngine
 import com.example.network.SpaceIdentifierParser
+import com.example.security.AuthStrategy
 import com.example.security.TokenRedactor
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -129,6 +130,9 @@ class SpaceDeckViewModel(application: Application) : AndroidViewModel(applicatio
     private val _isVerifyingToken = MutableStateFlow(false)
     val isVerifyingToken: StateFlow<Boolean> = _isVerifyingToken.asStateFlow()
 
+    private val _isOAuthInProgress = MutableStateFlow(false)
+    val isOAuthInProgress: StateFlow<Boolean> = _isOAuthInProgress.asStateFlow()
+
     private val _tokenError = MutableStateFlow<String?>(null)
     val tokenError: StateFlow<String?> = _tokenError.asStateFlow()
 
@@ -158,6 +162,15 @@ class SpaceDeckViewModel(application: Application) : AndroidViewModel(applicatio
 
     val hasDefaultToken: StateFlow<Boolean> = container.tokenStore.hasDefaultToken
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+
+    val hasOAuthToken: StateFlow<Boolean> = container.tokenStore.hasOAuthToken
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+
+    val oauthClientId: StateFlow<String> = container.tokenStore.oauthClientIdFlow
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), "")
+
+    val authStrategy: StateFlow<AuthStrategy> = container.tokenStore.authStrategyFlow
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), AuthStrategy.TOKEN_THEN_OAUTH)
 
     val sdkVersionsLabel: String
         get() = container.hybridSdkBridge.sdkVersionsLabel
@@ -427,12 +440,15 @@ class SpaceDeckViewModel(application: Application) : AndroidViewModel(applicatio
         val manifest = state.manifest ?: return
         val endpoint = state.selectedEndpoint ?: return
         viewModelScope.launch {
-            val token = container.tokenStore.resolveTokenForSpace(manifest.identity.spaceId, manifest.identity.hostUrl)
+            val credentialChain = container.tokenStore.resolveCredentialChainForSpace(
+                spaceId = manifest.identity.spaceId,
+                targetUrl = manifest.identity.hostUrl
+            )
             container.executionEngine.execute(
                 manifest = manifest,
                 endpoint = endpoint,
                 fieldValues = state.fieldValues,
-                token = token,
+                credentialChain = credentialChain,
                 onDiagnostic = { msg -> logDiagnostic("INFO", "Exec", msg) }
             )
         }
@@ -779,34 +795,14 @@ class SpaceDeckViewModel(application: Application) : AndroidViewModel(applicatio
             _isVerifyingToken.value = true
             _tokenError.value = null
             container.tokenStore.saveDefaultToken(cleaned)
+            container.hybridSdkBridge.clearAllSessions()
 
-            // Verify using bundled @huggingface/hub whoAmI() first, falling back to native Hub client
-            val sdkWhoAmI = container.hybridSdkBridge.whoAmI(cleaned).getOrNull()?.optJSONObject("data")
-            val verifiedInfo: Result<AccountInfo> = if (sdkWhoAmI != null && sdkWhoAmI.has("name")) {
-                val orgsArr = sdkWhoAmI.optJSONArray("orgs")
-                val orgs = if (orgsArr != null) {
-                    (0 until orgsArr.length()).mapNotNull { orgsArr.optJSONObject(it)?.optString("name") }
-                } else emptyList()
-                Result.success(
-                    AccountInfo(
-                        username = sdkWhoAmI.optString("name"),
-                        fullName = sdkWhoAmI.optString("fullname", ""),
-                        avatarUrl = sdkWhoAmI.optString("avatarUrl", ""),
-                        isPro = sdkWhoAmI.optBoolean("isPro", false),
-                        accountType = sdkWhoAmI.optString("type", "user"),
-                        orgs = orgs,
-                        verifiedAtMs = System.currentTimeMillis()
-                    )
-                )
-            } else {
-                container.hubClient.whoAmI(cleaned)
-            }
-
+            val verifiedInfo = verifyAccountWithToken(cleaned)
             verifiedInfo.onSuccess { info ->
                 container.tokenStore.saveAccountInfo(info)
                 _isVerifyingToken.value = false
-                logDiagnostic("INFO", "Auth", "Verified Hugging Face account @${info.username} (PRO=${info.isPro})")
-                showMessage("Signed in as @${info.username}")
+                logDiagnostic("INFO", "Auth", "Verified Hugging Face token for @${info.username} (PRO=${info.isPro})")
+                showMessage("Signed in as @${info.username} (Access Token)")
             }.onFailure { err ->
                 _isVerifyingToken.value = false
                 val msg = TokenRedactor.sanitize(err.message ?: "Token verification failed")
@@ -816,24 +812,120 @@ class SpaceDeckViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun saveOAuthClientId(clientId: String) {
+        viewModelScope.launch {
+            container.tokenStore.saveOAuthClientId(clientId)
+        }
+    }
+
+    fun startHfOAuthSignIn(clientIdInput: String): Intent? {
+        val clean = clientIdInput.trim()
+        if (clean.isEmpty()) {
+            _tokenError.value = "Enter your Hugging Face OAuth App Client ID first."
+            return null
+        }
+        _tokenError.value = null
+        viewModelScope.launch {
+            container.tokenStore.saveOAuthClientId(clean)
+        }
+        return runCatching {
+            _isOAuthInProgress.value = true
+            container.oauthManager.buildAuthorizeIntent(clean)
+        }.onFailure { err ->
+            _isOAuthInProgress.value = false
+            _tokenError.value = TokenRedactor.sanitize(err.message ?: "Could not start Hugging Face OAuth")
+        }.getOrNull()
+    }
+
+    private fun handleOAuthCallback(uri: Uri) {
+        viewModelScope.launch {
+            _isOAuthInProgress.value = true
+            _tokenError.value = null
+            val tokenResult = container.oauthManager.handleCallbackUri(uri)
+            tokenResult.onSuccess { oauthResp ->
+                container.tokenStore.saveOAuthToken(oauthResp.accessToken, oauthResp.expiresInSeconds)
+                container.hybridSdkBridge.clearAllSessions()
+                val verified = verifyAccountWithToken(oauthResp.accessToken)
+                verified.onSuccess { info ->
+                    container.tokenStore.saveAccountInfo(info)
+                    logDiagnostic("INFO", "OAuth", "Signed in via Hugging Face OAuth PKCE as @${info.username} (PRO=${info.isPro})")
+                    showMessage("Signed in via HF OAuth as @${info.username}")
+                }.onFailure {
+                    logDiagnostic("INFO", "OAuth", "Saved Hugging Face OAuth token via PKCE")
+                    showMessage("Hugging Face OAuth connected")
+                }
+                _isOAuthInProgress.value = false
+            }.onFailure { err ->
+                _isOAuthInProgress.value = false
+                val msg = TokenRedactor.sanitize(err.message ?: "Hugging Face OAuth sign-in failed")
+                _tokenError.value = msg
+                logDiagnostic("ERROR", "OAuth", msg)
+                showMessage(msg)
+            }
+        }
+    }
+
+    private suspend fun verifyAccountWithToken(token: String): Result<AccountInfo> {
+        val sdkWhoAmI = container.hybridSdkBridge.whoAmI(token).getOrNull()?.optJSONObject("data")
+        return if (sdkWhoAmI != null && sdkWhoAmI.has("name")) {
+            val orgsArr = sdkWhoAmI.optJSONArray("orgs")
+            val orgs = if (orgsArr != null) {
+                (0 until orgsArr.length()).mapNotNull { orgsArr.optJSONObject(it)?.optString("name") }
+            } else emptyList()
+            Result.success(
+                AccountInfo(
+                    username = sdkWhoAmI.optString("name"),
+                    fullName = sdkWhoAmI.optString("fullname", ""),
+                    avatarUrl = sdkWhoAmI.optString("avatarUrl", ""),
+                    isPro = sdkWhoAmI.optBoolean("isPro", false),
+                    accountType = sdkWhoAmI.optString("type", "user"),
+                    orgs = orgs,
+                    verifiedAtMs = System.currentTimeMillis()
+                )
+            )
+        } else {
+            container.hubClient.whoAmI(token)
+        }
+    }
+
     fun clearDefaultToken() {
         viewModelScope.launch {
             container.tokenStore.clearDefaultToken()
+            container.hybridSdkBridge.clearAllSessions()
             _tokenError.value = null
-            showMessage("Token cleared from Android Keystore vault")
+            showMessage("Access token cleared from Android Keystore vault")
+        }
+    }
+
+    fun clearOAuthToken() {
+        viewModelScope.launch {
+            container.tokenStore.clearOAuthToken()
+            container.hybridSdkBridge.clearAllSessions()
+            _tokenError.value = null
+            showMessage("Hugging Face OAuth session disconnected")
+        }
+    }
+
+    fun setAuthStrategy(strategy: AuthStrategy) {
+        viewModelScope.launch {
+            container.tokenStore.setAuthStrategy(strategy)
+            container.hybridSdkBridge.clearAllSessions()
+            showMessage("Auth priority: ${strategy.label}")
         }
     }
 
     fun setAnonymousMode(enabled: Boolean) {
         viewModelScope.launch {
             container.tokenStore.setAnonymousMode(enabled)
-            showMessage(if (enabled) "Anonymous mode enabled" else "Using saved account token")
+            container.hybridSdkBridge.clearAllSessions()
+            showMessage(if (enabled) "Anonymous mode enabled" else "Using saved credentials")
         }
     }
 
     fun setSpaceAuthPreference(spaceId: String, mode: SpaceAuthMode, customToken: String? = null) {
         viewModelScope.launch {
             container.tokenStore.setSpaceAuthPreference(spaceId, mode, customToken)
+            container.hybridSdkBridge.clearAllSessions()
             refreshPerSpaceAuthModes()
             if (_workbenchState.value.manifest?.identity?.spaceId == spaceId) {
                 _workbenchState.update { it.copy(spaceAuthMode = mode) }
@@ -874,6 +966,11 @@ class SpaceDeckViewModel(application: Application) : AndroidViewModel(applicatio
         if (intent == null) return
         when (intent.action) {
             Intent.ACTION_VIEW -> {
+                val uri = intent.data ?: return
+                if (uri.scheme == "spacedeck" && uri.host == "oauth") {
+                    handleOAuthCallback(uri)
+                    return
+                }
                 val url = intent.dataString ?: return
                 if (SpaceIdentifierParser.parse(url) != null) {
                     openSpace(url)

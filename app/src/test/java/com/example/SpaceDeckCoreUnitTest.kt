@@ -124,9 +124,25 @@ class SpaceDeckCoreUnitTest {
         assertFalse(AllowedHosts.isAllowedNetworkTarget("https://127.0.0.1/admin"))
         assertFalse(AllowedHosts.isAllowedNetworkTarget("https://169.254.169.254/latest/meta-data"))
 
-        val redacted = TokenRedactor.sanitize("Failed Authorization: Bearer hf_abcdefghijklmnop12345")
+        val redacted = TokenRedactor.sanitize(
+            "Failed Authorization: Bearer hf_abcdefghijklmnop12345 url=https://victor-app.hf.space/call/run?__sign=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyMTIzNDU2In0.abcdef1234567890"
+        )
         assertFalse(redacted.contains("hf_abcdef"))
+        assertFalse(redacted.contains("eyJhbGci"))
+        assertTrue(redacted.contains("__sign=[REDACTED]"))
         assertTrue(redacted.contains("[REDACTED]"))
+
+        val signedTrusted = com.example.network.GradioNativeClient.appendSignParam(
+            "https://victor-longcat.hf.space/gradio_api/call/predict",
+            "jwt.token.val"
+        )
+        assertTrue(signedTrusted.endsWith("?__sign=jwt.token.val"))
+
+        val signedUntrusted = com.example.network.GradioNativeClient.appendSignParam(
+            "https://evil.example.com/gradio_api/call/predict",
+            "jwt.token.val"
+        )
+        assertFalse(signedUntrusted.contains("__sign="))
     }
 
     @Test
