@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SpaceDeck</string>
+    <string name="nav_explore">Explore</string>
+    <string name="nav_workbench">Workbench</string>
+    <string name="nav_media">Media</string>
+    <string name="nav_vault">Vault</string>
+    <string name="cd_back">Navigate back</string>
+    <string name="cd_refresh">Refresh</string>
+    <string name="cd_favorite">Toggle favorite</string>
+    <string name="cd_share">Share</string>
+    <string name="cd_download">Download</string>
+    <string name="cd_copy">Copy</string>
+    <string name="cd_delete">Delete</string>
+    <string name="cd_play_pause">Play or pause</string>
+    <string name="cd_toggle_visibility">Toggle token visibility</string>
+    <string name="cd_space_shortcut">Pin shortcut to home screen</string>
+    <string name="cd_full_space_view">Toggle full space view</string>
+    <string name="cd_source_inspector">Open source and GPU inspector</string>
+    <string name="cd_customize_profile">Customize space controls</string>
+    <string name="cd_presets">Generation presets</string>
+    <string name="cd_send_to_space">Send media to another Space</string>
+    <string name="cd_clear_input">Clear input</string>
+    <string name="cd_open_browser">Open in external browser</string>
+    <string name="cd_record_audio">Record audio from microphone</string>
+    <string name="cd_capture_photo">Capture photo with camera</string>
+    <string name="cd_pick_media">Pick media from gallery</string>
+    <string name="cd_pick_file">Pick file from device</string>
+    <string name="cd_pick_library">Pick from shared media library</string>
+    <string name="notification_channel_jobs_name">Space Jobs</string>
+    <string name="notification_channel_jobs_desc">Live progress and completion alerts for remote Space runs</string>
+</resources>

@@ -1,0 +1,6 @@
+{
+  "name": "SpaceDeck",
+  "description": "Universal mobile client and dynamic interface builder for Hugging Face Gradio Spaces.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

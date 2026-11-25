@@ -1,0 +1,993 @@
+package com.example.network
+
+import android.content.Context
+import android.net.Uri
+import android.util.Base64
+import com.example.data.local.JobRecordDao
+import com.example.data.local.JobRecordEntity
+import com.example.media.MediaLibraryManager
+import com.example.model.ActiveJobState
+import com.example.model.ComponentField
+import com.example.model.ComponentKind
+import com.example.model.EndpointManifest
+import com.example.model.FieldValue
+import com.example.model.JobStatus
+import com.example.model.OutputItem
+import com.example.model.SpaceManifest
+import com.example.security.TokenRedactor
+import com.example.service.SpaceJobMonitorService
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.util.UUID
+
+class SpaceExecutionEngine(
+    private val context: Context,
+    private val hybridSdkBridge: HybridSdkBridge,
+    private val gradioNativeClient: GradioNativeClient,
+    private val mediaLibraryManager: MediaLibraryManager,
+    private val jobRecordDao: JobRecordDao
+) {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val sessionHashes = mutableMapOf<String, String>()
+
+    private val _activeJob = MutableStateFlow(ActiveJobState())
+    val activeJob: StateFlow<ActiveJobState> = _activeJob.asStateFlow()
+
+    private val _outputs = MutableStateFlow<List<OutputItem>>(emptyList())
+    val outputs: StateFlow<List<OutputItem>> = _outputs.asStateFlow()
+
+    private var currentRunJob: Job? = null
+    private var timerJob: Job? = null
+    private var currentSpaceHost: String = ""
+    private var currentApiPrefix: String = ""
+    private var currentToken: String? = null
+    private var currentSessionHash: String = ""
+    private var currentTransport: String = ""
+
+    fun clearOutputs() {
+        _outputs.value = emptyList()
+        if (_activeJob.value.status !in setOf(JobStatus.UPLOADING, JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.STREAMING)) {
+            _activeJob.value = ActiveJobState()
+        }
+    }
+
+    fun execute(
+        manifest: SpaceManifest,
+        endpoint: EndpointManifest,
+        fieldValues: Map<String, FieldValue>,
+        token: String?,
+        onDiagnostic: (String) -> Unit
+    ) {
+        currentRunJob?.cancel()
+        timerJob?.cancel()
+
+        val jobId = UUID.randomUUID().toString()
+        val startedAt = System.currentTimeMillis()
+        val sessionHash = sessionHashes.getOrPut(manifest.identity.spaceId) {
+            UUID.randomUUID().toString().replace("-", "").take(12)
+        }
+        currentSpaceHost = manifest.identity.hostUrl
+        currentApiPrefix = manifest.provenance.apiPrefix
+        currentToken = token
+        currentSessionHash = sessionHash
+        currentTransport = ""
+
+        val declaredGpuSec = endpoint.zeroGpuDecorator?.declaredDurationSeconds
+            ?: manifest.hardware.decorators.firstOrNull()?.declaredDurationSeconds
+
+        _outputs.value = emptyList()
+        _activeJob.value = ActiveJobState(
+            jobId = jobId,
+            spaceId = manifest.identity.spaceId,
+            endpointLabel = endpoint.label,
+            status = JobStatus.UPLOADING,
+            transport = "initializing",
+            progressMessage = "Preparing inputs…",
+            startedAtMs = startedAt,
+            elapsedMs = 0L,
+            declaredZeroGpuSeconds = declaredGpuSec
+        )
+
+        SpaceJobMonitorService.updateProgress(
+            context,
+            "${manifest.identity.title} • ${endpoint.label}",
+            "Preparing inputs…"
+        )
+
+        timerJob = scope.launch {
+            while (isActive) {
+                delay(500)
+                val st = _activeJob.value.status
+                if (st in setOf(JobStatus.UPLOADING, JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.STREAMING)) {
+                    _activeJob.update { it.copy(elapsedMs = System.currentTimeMillis() - startedAt) }
+                } else {
+                    break
+                }
+            }
+        }
+
+        currentRunJob = scope.launch {
+            persistJobRecord(
+                jobId = jobId,
+                manifest = manifest,
+                endpoint = endpoint,
+                status = JobStatus.UPLOADING,
+                transport = "pending",
+                startedAt = startedAt,
+                finishedAt = null,
+                declaredGpuSec = declaredGpuSec,
+                summary = "Uploading inputs…",
+                error = null,
+                outputs = emptyList()
+            )
+
+            try {
+                // Priority 1: Try Official Bundled @gradio/client (handle_file + app.submit)
+                val jsPayload = buildJsSdkArgsIfSmallEnough(endpoint.inputs, fieldValues)
+                var completedViaJs = false
+
+                if (jsPayload != null && hybridSdkBridge.awaitReady(timeoutMs = 2500L)) {
+                    currentTransport = "@gradio/client@1.14.2"
+                    _activeJob.update {
+                        it.copy(
+                            status = JobStatus.QUEUED,
+                            transport = currentTransport,
+                            progressMessage = "Submitting via @gradio/client…"
+                        )
+                    }
+                    onDiagnostic("Priority 1: Submitting ${endpoint.callableTarget} via bundled @gradio/client@1.14.2.")
+
+                    val submitRes = hybridSdkBridge.submitJob(
+                        jobId = jobId,
+                        sessionKey = manifest.identity.spaceId,
+                        spaceRef = manifest.identity.hostUrl,
+                        token = token,
+                        endpoint = endpoint.callableTarget,
+                        rawArgsJson = jsPayload.toString()
+                    )
+
+                    if (submitRes.isSuccess) {
+                        val jsOutcome = consumeJsJobEvents(jobId, manifest, endpoint, startedAt, declaredGpuSec, token, onDiagnostic)
+                        if (jsOutcome) {
+                            completedViaJs = true
+                        }
+                    } else {
+                        val err = TokenRedactor.sanitize(submitRes.exceptionOrNull()?.message.orEmpty())
+                        onDiagnostic("@gradio/client submission fell back to native REST/SSE: $err")
+                    }
+                }
+
+                // Priority 2 & 3: Version-Aware Native Kotlin Gradio REST/SSE + Native OkHttp Multipart Upload
+                if (!completedViaJs) {
+                    currentTransport = "native_gradio_sse"
+                    _activeJob.update {
+                        it.copy(
+                            status = JobStatus.UPLOADING,
+                            transport = currentTransport,
+                            progressMessage = "Uploading files via native HTTP…"
+                        )
+                    }
+                    onDiagnostic("Priority 2: Running ${endpoint.callableTarget} via version-aware Native Gradio REST/SSE.")
+
+                    val nativeArgs = buildNativeArgsWithUploads(
+                        hostUrl = manifest.identity.hostUrl,
+                        apiPrefix = manifest.provenance.apiPrefix,
+                        fields = endpoint.inputs,
+                        values = fieldValues,
+                        token = token,
+                        onDiagnostic = onDiagnostic
+                    )
+
+                    _activeJob.update {
+                        it.copy(status = JobStatus.QUEUED, progressMessage = "Joining Space queue…")
+                    }
+                    SpaceJobMonitorService.updateProgress(
+                        context,
+                        "${manifest.identity.title} • ${endpoint.label}",
+                        "Running on remote Space…"
+                    )
+
+                    gradioNativeClient.executeEndpoint(
+                        hostUrl = manifest.identity.hostUrl,
+                        apiPrefix = manifest.provenance.apiPrefix,
+                        apiName = endpoint.apiName,
+                        fnIndex = endpoint.fnIndex,
+                        dataArray = nativeArgs,
+                        sessionHash = sessionHash,
+                        token = token
+                    ) { event ->
+                        when (event) {
+                            is NativeStreamEvent.QueueStatus -> {
+                                val nextStatus = if (event.position == 0 || event.progress != null) JobStatus.RUNNING else JobStatus.QUEUED
+                                _activeJob.update {
+                                    it.copy(
+                                        status = nextStatus,
+                                        queuePosition = event.position ?: it.queuePosition,
+                                        queueSize = event.queueSize ?: it.queueSize,
+                                        etaSeconds = event.etaSeconds ?: it.etaSeconds,
+                                        progressFraction = event.progress ?: it.progressFraction,
+                                        progressMessage = event.message.ifBlank { it.progressMessage },
+                                        elapsedMs = System.currentTimeMillis() - startedAt
+                                    )
+                                }
+                            }
+                            is NativeStreamEvent.Generating -> {
+                                val parsed = parseOutputs(
+                                    dataArray = event.data,
+                                    outputSpecs = endpoint.outputs,
+                                    hostUrl = manifest.identity.hostUrl,
+                                    apiPrefix = manifest.provenance.apiPrefix,
+                                    spaceId = manifest.identity.spaceId,
+                                    jobId = jobId,
+                                    token = token,
+                                    cacheMedia = false
+                                )
+                                _outputs.value = parsed
+                                _activeJob.update {
+                                    it.copy(
+                                        status = JobStatus.STREAMING,
+                                        isIntermediate = true,
+                                        progressMessage = event.message,
+                                        elapsedMs = System.currentTimeMillis() - startedAt
+                                    )
+                                }
+                            }
+                            is NativeStreamEvent.Completed -> {
+                                val parsed = parseOutputs(
+                                    dataArray = event.data,
+                                    outputSpecs = endpoint.outputs,
+                                    hostUrl = manifest.identity.hostUrl,
+                                    apiPrefix = manifest.provenance.apiPrefix,
+                                    spaceId = manifest.identity.spaceId,
+                                    jobId = jobId,
+                                    token = token,
+                                    cacheMedia = true
+                                )
+                                _outputs.value = parsed
+                                val now = System.currentTimeMillis()
+                                _activeJob.update {
+                                    it.copy(
+                                        status = JobStatus.COMPLETED,
+                                        isIntermediate = false,
+                                        progressFraction = 1f,
+                                        progressMessage = "Completed (${parsed.size} output${if (parsed.size == 1) "" else "s"})",
+                                        elapsedMs = now - startedAt
+                                    )
+                                }
+                                persistJobRecord(
+                                    jobId = jobId,
+                                    manifest = manifest,
+                                    endpoint = endpoint,
+                                    status = JobStatus.COMPLETED,
+                                    transport = currentTransport,
+                                    startedAt = startedAt,
+                                    finishedAt = now,
+                                    declaredGpuSec = declaredGpuSec,
+                                    summary = summarizeOutputs(parsed),
+                                    error = null,
+                                    outputs = parsed
+                                )
+                                SpaceJobMonitorService.notifyComplete(
+                                    context,
+                                    "${manifest.identity.title} finished",
+                                    summarizeOutputs(parsed)
+                                )
+                                onDiagnostic("Completed in ${(now - startedAt) / 1000.0}s with ${parsed.size} outputs.")
+                            }
+                            is NativeStreamEvent.Error -> {
+                                handleJobFailure(
+                                    jobId = jobId,
+                                    manifest = manifest,
+                                    endpoint = endpoint,
+                                    startedAt = startedAt,
+                                    declaredGpuSec = declaredGpuSec,
+                                    error = event.message,
+                                    isQuota = event.isQuotaError,
+                                    onDiagnostic = onDiagnostic
+                                )
+                            }
+                        }
+                    }
+                }
+            } catch (_: CancellationException) {
+                val now = System.currentTimeMillis()
+                _activeJob.update {
+                    it.copy(
+                        status = JobStatus.CANCELLED,
+                        progressMessage = "Cancelled by user",
+                        elapsedMs = now - startedAt
+                    )
+                }
+                persistJobRecord(
+                    jobId = jobId,
+                    manifest = manifest,
+                    endpoint = endpoint,
+                    status = JobStatus.CANCELLED,
+                    transport = currentTransport,
+                    startedAt = startedAt,
+                    finishedAt = now,
+                    declaredGpuSec = declaredGpuSec,
+                    summary = "Cancelled",
+                    error = null,
+                    outputs = _outputs.value
+                )
+                SpaceJobMonitorService.stop(context)
+            } catch (e: Exception) {
+                val clean = TokenRedactor.sanitize(e.message ?: "Execution failed")
+                handleJobFailure(
+                    jobId = jobId,
+                    manifest = manifest,
+                    endpoint = endpoint,
+                    startedAt = startedAt,
+                    declaredGpuSec = declaredGpuSec,
+                    error = clean,
+                    isQuota = clean.contains("quota", true) || clean.contains("zerogpu", true),
+                    onDiagnostic = onDiagnostic
+                )
+            } finally {
+                timerJob?.cancel()
+            }
+        }
+    }
+
+    fun cancelActiveJob(onDiagnostic: (String) -> Unit) {
+        val active = _activeJob.value
+        if (active.jobId.isBlank()) return
+        onDiagnostic("Cancelling job ${active.jobId.take(8)}…")
+        scope.launch {
+            if (currentTransport.contains("gradio/client")) {
+                hybridSdkBridge.cancelJob(active.jobId)
+            } else if (currentSpaceHost.isNotBlank() && currentSessionHash.isNotBlank()) {
+                gradioNativeClient.cancelSession(currentSpaceHost, currentApiPrefix, currentSessionHash, currentToken)
+            }
+        }
+        currentRunJob?.cancel()
+        timerJob?.cancel()
+        SpaceJobMonitorService.stop(context)
+    }
+
+    private suspend fun consumeJsJobEvents(
+        jobId: String,
+        manifest: SpaceManifest,
+        endpoint: EndpointManifest,
+        startedAt: Long,
+        declaredGpuSec: Int?,
+        token: String?,
+        onDiagnostic: (String) -> Unit
+    ): Boolean {
+        var sawData = false
+        while (true) {
+            val ev = hybridSdkBridge.jobEvents.first { it.jobId == jobId }
+            when (ev.type) {
+                "status" -> {
+                    val stage = ev.payload.optString("stage", "")
+                    val pos = if (ev.payload.has("position") && !ev.payload.isNull("position")) ev.payload.optInt("position") else null
+                    val size = if (ev.payload.has("size") && !ev.payload.isNull("size")) ev.payload.optInt("size") else null
+                    val eta = if (ev.payload.has("eta") && !ev.payload.isNull("eta")) ev.payload.optDouble("eta") else null
+                    val msg = ev.payload.optString("message", stage)
+                    if (stage == "error") {
+                        val clean = TokenRedactor.sanitize(msg.ifBlank { "Space execution error" })
+                        if (!sawData && clean.contains("fetch", true)) {
+                            // Allow fallback to native HTTP client on transport/CORS errors before any output
+                            onDiagnostic("@gradio/client transport error, falling back to native SSE: $clean")
+                            return false
+                        }
+                        handleJobFailure(
+                            jobId, manifest, endpoint, startedAt, declaredGpuSec,
+                            error = clean,
+                            isQuota = clean.contains("quota", true) || clean.contains("zerogpu", true),
+                            onDiagnostic = onDiagnostic
+                        )
+                        return true
+                    }
+                    _activeJob.update {
+                        it.copy(
+                            status = if (stage == "pending") JobStatus.QUEUED else JobStatus.RUNNING,
+                            queuePosition = pos ?: it.queuePosition,
+                            queueSize = size ?: it.queueSize,
+                            etaSeconds = eta ?: it.etaSeconds,
+                            progressMessage = msg.ifBlank { "Running via @gradio/client…" },
+                            elapsedMs = System.currentTimeMillis() - startedAt
+                        )
+                    }
+                }
+                "data" -> {
+                    sawData = true
+                    val dataArr = ev.payload.optJSONArray("data") ?: JSONArray()
+                    val parsed = parseOutputs(
+                        dataArray = dataArr,
+                        outputSpecs = endpoint.outputs,
+                        hostUrl = manifest.identity.hostUrl,
+                        apiPrefix = manifest.provenance.apiPrefix,
+                        spaceId = manifest.identity.spaceId,
+                        jobId = jobId,
+                        token = token,
+                        cacheMedia = true
+                    )
+                    _outputs.value = parsed
+                    _activeJob.update {
+                        it.copy(
+                            status = JobStatus.STREAMING,
+                            isIntermediate = true,
+                            progressMessage = "Received output stream…",
+                            elapsedMs = System.currentTimeMillis() - startedAt
+                        )
+                    }
+                }
+                "done" -> {
+                    val now = System.currentTimeMillis()
+                    val finalOutputs = _outputs.value
+                    _activeJob.update {
+                        it.copy(
+                            status = JobStatus.COMPLETED,
+                            isIntermediate = false,
+                            progressFraction = 1f,
+                            progressMessage = "Completed via @gradio/client",
+                            elapsedMs = now - startedAt
+                        )
+                    }
+                    persistJobRecord(
+                        jobId = jobId,
+                        manifest = manifest,
+                        endpoint = endpoint,
+                        status = JobStatus.COMPLETED,
+                        transport = currentTransport,
+                        startedAt = startedAt,
+                        finishedAt = now,
+                        declaredGpuSec = declaredGpuSec,
+                        summary = summarizeOutputs(finalOutputs),
+                        error = null,
+                        outputs = finalOutputs
+                    )
+                    SpaceJobMonitorService.notifyComplete(
+                        context,
+                        "${manifest.identity.title} finished",
+                        summarizeOutputs(finalOutputs)
+                    )
+                    return true
+                }
+                "error" -> {
+                    val msg = TokenRedactor.sanitize(ev.payload.optString("message", "Execution error"))
+                    if (!sawData) {
+                        onDiagnostic("@gradio/client stream error before data, falling back to native SSE: $msg")
+                        return false
+                    }
+                    handleJobFailure(
+                        jobId, manifest, endpoint, startedAt, declaredGpuSec,
+                        error = msg,
+                        isQuota = msg.contains("quota", true) || msg.contains("zerogpu", true),
+                        onDiagnostic = onDiagnostic
+                    )
+                    return true
+                }
+            }
+        }
+    }
+
+    /**
+     * Builds arguments for JS SDK. If any binary file exceeds 6MB, returns null to use streaming
+     * native multipart HTTP upload (avoids WebView IPC memory overhead for large videos/audio).
+     */
+    private suspend fun buildJsSdkArgsIfSmallEnough(
+        fields: List<ComponentField>,
+        values: Map<String, FieldValue>
+    ): JSONArray? {
+        val arr = JSONArray()
+        for (field in fields) {
+            val value = values[field.id] ?: defaultValueForField(field)
+            when (value) {
+                is FieldValue.MediaRef -> {
+                    val obj = JSONObject().put("__spacedeck_file", true)
+                    val localFile = resolveMediaFile(value)
+                    if (localFile != null) {
+                        if (localFile.length() > 6 * 1024 * 1024) return null // Prefer native multipart upload for >6MB
+                        val b64 = Base64.encodeToString(localFile.readBytes(), Base64.NO_WRAP)
+                        obj.put("base64", b64)
+                        obj.put("fileName", value.fileName)
+                        obj.put("mimeType", value.mimeType)
+                        arr.put(obj)
+                    } else if (!value.remoteUrl.isNullOrBlank()) {
+                        obj.put("url", value.remoteUrl)
+                        arr.put(obj)
+                    } else {
+                        arr.put(JSONObject.NULL)
+                    }
+                }
+                is FieldValue.Multimodal -> return null // Handle multimodal natively for clean FileData dicts
+                else -> arr.put(serializeSimpleValue(field, value))
+            }
+        }
+        return arr
+    }
+
+    private suspend fun buildNativeArgsWithUploads(
+        hostUrl: String,
+        apiPrefix: String,
+        fields: List<ComponentField>,
+        values: Map<String, FieldValue>,
+        token: String?,
+        onDiagnostic: (String) -> Unit
+    ): JSONArray {
+        val arr = JSONArray()
+        for (field in fields) {
+            val value = values[field.id] ?: defaultValueForField(field)
+            when (value) {
+                is FieldValue.MediaRef -> {
+                    val uploaded = uploadMediaRef(hostUrl, apiPrefix, value, token, onDiagnostic)
+                    arr.put(uploaded ?: JSONObject.NULL)
+                }
+                is FieldValue.Multimodal -> {
+                    val fileObjects = JSONArray()
+                    for (ref in value.files) {
+                        uploadMediaRef(hostUrl, apiPrefix, ref, token, onDiagnostic)?.let { fileObjects.put(it) }
+                    }
+                    arr.put(JSONObject().apply {
+                        put("text", value.text)
+                        put("files", fileObjects)
+                    })
+                }
+                else -> arr.put(serializeSimpleValue(field, value))
+            }
+        }
+        return arr
+    }
+
+    private suspend fun uploadMediaRef(
+        hostUrl: String,
+        apiPrefix: String,
+        ref: FieldValue.MediaRef,
+        token: String?,
+        onDiagnostic: (String) -> Unit
+    ): JSONObject? {
+        val localFile = resolveMediaFile(ref)
+        if (localFile != null && localFile.exists()) {
+            onDiagnostic("Uploading ${ref.fileName} (${localFile.length() / 1024} KB)…")
+            val res = gradioNativeClient.uploadFile(
+                hostUrl = hostUrl,
+                apiPrefix = apiPrefix,
+                file = localFile,
+                fileName = ref.fileName,
+                mimeType = ref.mimeType,
+                token = token
+            )
+            return res.getOrThrow()
+        }
+        if (!ref.remoteUrl.isNullOrBlank()) {
+            return JSONObject().apply {
+                put("url", ref.remoteUrl)
+                put("orig_name", ref.fileName)
+                put("mime_type", ref.mimeType)
+                put("meta", JSONObject().put("_type", "gradio.FileData"))
+            }
+        }
+        return null
+    }
+
+    private suspend fun resolveMediaFile(ref: FieldValue.MediaRef): File? {
+        if (!ref.localPath.isNullOrBlank()) {
+            val f = File(ref.localPath)
+            if (f.exists()) return f
+        }
+        if (!ref.uriString.isNullOrBlank()) {
+            val uri = runCatching { Uri.parse(ref.uriString) }.getOrNull() ?: return null
+            val copied = mediaLibraryManager.copyLocalFileToTempUpload(uri).getOrNull()
+            return copied?.first
+        }
+        return null
+    }
+
+    private fun serializeSimpleValue(field: ComponentField, value: FieldValue): Any {
+        return when (value) {
+            is FieldValue.Text -> value.value
+            is FieldValue.NumberVal -> {
+                if (field.apiDataType.equals("integer", true) || (field.step != null && field.step % 1.0 == 0.0 && value.value % 1.0 == 0.0)) {
+                    value.value.toLong()
+                } else {
+                    value.value
+                }
+            }
+            is FieldValue.BoolVal -> value.value
+            is FieldValue.MultiSelect -> JSONArray(value.values)
+            is FieldValue.StructuredJson -> {
+                val trimmed = value.rawJson.trim()
+                when {
+                    trimmed.startsWith("{") -> runCatching { JSONObject(trimmed) }.getOrDefault(trimmed)
+                    trimmed.startsWith("[") -> runCatching { JSONArray(trimmed) }.getOrDefault(trimmed)
+                    trimmed == "null" || trimmed.isEmpty() -> JSONObject.NULL
+                    else -> trimmed
+                }
+            }
+            is FieldValue.Empty -> JSONObject.NULL
+            else -> JSONObject.NULL
+        }
+    }
+
+    private suspend fun parseOutputs(
+        dataArray: JSONArray,
+        outputSpecs: List<ComponentField>,
+        hostUrl: String,
+        apiPrefix: String,
+        spaceId: String,
+        jobId: String,
+        token: String?,
+        cacheMedia: Boolean
+    ): List<OutputItem> {
+        val result = mutableListOf<OutputItem>()
+        for (i in 0 until dataArray.length()) {
+            val raw = dataArray.opt(i)
+            val spec = outputSpecs.getOrNull(i)
+            val label = spec?.label ?: "Output ${i + 1}"
+            val specKind = spec?.kind ?: ComponentKind.UNKNOWN
+            result.add(
+                interpretSingleOutput(
+                    index = i,
+                    label = label,
+                    hintKind = specKind,
+                    raw = raw,
+                    hostUrl = hostUrl,
+                    apiPrefix = apiPrefix,
+                    spaceId = spaceId,
+                    jobId = jobId,
+                    token = token,
+                    cacheMedia = cacheMedia
+                )
+            )
+        }
+        return result
+    }
+
+    private suspend fun interpretSingleOutput(
+        index: Int,
+        label: String,
+        hintKind: ComponentKind,
+        raw: Any?,
+        hostUrl: String,
+        apiPrefix: String,
+        spaceId: String,
+        jobId: String,
+        token: String?,
+        cacheMedia: Boolean
+    ): OutputItem {
+        if (raw == null || raw === JSONObject.NULL) {
+            return OutputItem(index = index, label = label, kind = hintKind, textValue = "(empty)", rawJson = "null")
+        }
+
+        // Handle Gradio Gallery (JSONArray of image objects/captions)
+        if (hintKind == ComponentKind.GALLERY && raw is JSONArray) {
+            val galleryItems = mutableListOf<OutputItem>()
+            for (g in 0 until raw.length()) {
+                val entry = raw.opt(g)
+                val imgObj = if (entry is JSONObject && entry.has("image")) entry.opt("image") else entry
+                val caption = if (entry is JSONObject) entry.optString("caption", "Image ${g + 1}") else "Image ${g + 1}"
+                galleryItems.add(
+                    interpretSingleOutput(g, caption, ComponentKind.IMAGE, imgObj, hostUrl, apiPrefix, spaceId, jobId, token, cacheMedia)
+                )
+            }
+            return OutputItem(index = index, label = label, kind = ComponentKind.GALLERY, galleryItems = galleryItems, rawJson = raw.toString())
+        }
+
+        // Handle Gradio Chatbot (JSONArray of [user, bot] pairs or {role, content} objects)
+        if (hintKind == ComponentKind.CHATBOT && raw is JSONArray) {
+            val msgs = mutableListOf<Pair<String, String>>()
+            for (c in 0 until raw.length()) {
+                val item = raw.opt(c)
+                when (item) {
+                    is JSONArray -> {
+                        val u = item.optString(0, "")
+                        val b = item.optString(1, "")
+                        if (u.isNotBlank()) msgs.add("User" to u)
+                        if (b.isNotBlank()) msgs.add("Space" to b)
+                    }
+                    is JSONObject -> {
+                        val role = item.optString("role", "Space")
+                        val content = item.optString("content", "")
+                        msgs.add(role to content)
+                    }
+                }
+            }
+            return OutputItem(index = index, label = label, kind = ComponentKind.CHATBOT, chatMessages = msgs, rawJson = raw.toString())
+        }
+
+        // Handle Gradio DataFrame ({headers: [...], data: [[...]]})
+        if (raw is JSONObject && raw.has("headers") && raw.has("data") && raw.opt("data") is JSONArray) {
+            val hArr = raw.optJSONArray("headers") ?: JSONArray()
+            val dArr = raw.optJSONArray("data") ?: JSONArray()
+            val headers = (0 until hArr.length()).map { hArr.optString(it) }
+            val rows = (0 until dArr.length()).map { r ->
+                val rowArr = dArr.optJSONArray(r) ?: JSONArray()
+                (0 until rowArr.length()).map { c -> rowArr.optString(c) }
+            }
+            return OutputItem(index = index, label = label, kind = ComponentKind.DATAFRAME, tableHeaders = headers, tableRows = rows, rawJson = raw.toString())
+        }
+
+        // Handle Gradio FileData / Media object ({url, path, orig_name, mime_type} or {video: {...}})
+        if (raw is JSONObject) {
+            val nestedVideo = raw.optJSONObject("video")
+            val mediaObj = nestedVideo ?: raw
+            val urlField = mediaObj.optString("url", "")
+            val pathField = mediaObj.optString("path", "")
+            if (urlField.isNotBlank() || pathField.isNotBlank()) {
+                val resolvedUrl = resolveRemoteFileUrl(urlField, pathField, hostUrl, apiPrefix)
+                val fileName = mediaObj.optString("orig_name", "").ifBlank {
+                    resolvedUrl.substringAfterLast('/').substringBefore('?').ifBlank { "output_$index" }
+                }
+                val mime = mediaObj.optString("mime_type", "").ifBlank { guessMimeFromName(fileName, hintKind) }
+                val resolvedKind = refineMediaKind(hintKind, mime, fileName)
+
+                var cachedPath: String? = null
+                var assetId: String? = null
+                if (cacheMedia && resolvedUrl.startsWith("https://")) {
+                    val cached = mediaLibraryManager.cacheRemoteMedia(
+                        remoteUrl = resolvedUrl,
+                        spaceId = spaceId,
+                        jobId = jobId,
+                        fileNameHint = fileName,
+                        mimeTypeHint = mime,
+                        token = token
+                    ).getOrNull()
+                    if (cached != null) {
+                        cachedPath = cached.localFilePath
+                        assetId = cached.id
+                    }
+                }
+
+                return OutputItem(
+                    index = index,
+                    label = label,
+                    kind = resolvedKind,
+                    mediaUrl = resolvedUrl,
+                    localCachedPath = cachedPath,
+                    mimeType = mime,
+                    fileName = fileName,
+                    rawJson = raw.toString(),
+                    mediaAssetId = assetId
+                )
+            }
+            return OutputItem(index = index, label = label, kind = ComponentKind.JSON, textValue = raw.toString(2), rawJson = raw.toString())
+        }
+
+        // Handle direct URL string to media
+        val str = raw.toString()
+        if (str.startsWith("https://") && (hintKind in setOf(ComponentKind.IMAGE, ComponentKind.AUDIO, ComponentKind.VIDEO, ComponentKind.FILE))) {
+            val fileName = str.substringAfterLast('/').substringBefore('?').ifBlank { "output_$index" }
+            val mime = guessMimeFromName(fileName, hintKind)
+            var cachedPath: String? = null
+            var assetId: String? = null
+            if (cacheMedia) {
+                mediaLibraryManager.cacheRemoteMedia(str, spaceId, jobId, fileName, mime, token).getOrNull()?.let {
+                    cachedPath = it.localFilePath
+                    assetId = it.id
+                }
+            }
+            return OutputItem(
+                index = index,
+                label = label,
+                kind = refineMediaKind(hintKind, mime, fileName),
+                mediaUrl = str,
+                localCachedPath = cachedPath,
+                mimeType = mime,
+                fileName = fileName,
+                rawJson = JSONObject.quote(str),
+                mediaAssetId = assetId
+            )
+        }
+
+        val finalKind = if (raw is JSONArray) ComponentKind.JSON else if (hintKind == ComponentKind.UNKNOWN) ComponentKind.TEXTBOX else hintKind
+        return OutputItem(
+            index = index,
+            label = label,
+            kind = finalKind,
+            textValue = if (raw is JSONArray) raw.toString(2) else str,
+            rawJson = raw.toString()
+        )
+    }
+
+    private fun resolveRemoteFileUrl(urlField: String, pathField: String, hostUrl: String, apiPrefix: String): String {
+        val base = hostUrl.trimEnd('/')
+        if (urlField.startsWith("http://") || urlField.startsWith("https://")) return urlField
+        if (urlField.startsWith("/")) return "$base$urlField"
+        val prefix = apiPrefix.ifBlank { "/gradio_api" }
+        return "$base$prefix/file=$pathField"
+    }
+
+    private fun refineMediaKind(hint: ComponentKind, mime: String, fileName: String): ComponentKind {
+        val m = mime.lowercase()
+        val f = fileName.lowercase()
+        return when {
+            m.startsWith("image/") || f.endsWith(".png") || f.endsWith(".jpg") || f.endsWith(".jpeg") || f.endsWith(".webp") -> ComponentKind.IMAGE
+            m.startsWith("audio/") || f.endsWith(".wav") || f.endsWith(".mp3") || f.endsWith(".flac") || f.endsWith(".m4a") || f.endsWith(".ogg") -> ComponentKind.AUDIO
+            m.startsWith("video/") || f.endsWith(".mp4") || f.endsWith(".webm") || f.endsWith(".mov") -> ComponentKind.VIDEO
+            hint in setOf(ComponentKind.IMAGE, ComponentKind.AUDIO, ComponentKind.VIDEO, ComponentKind.FILE) -> hint
+            else -> ComponentKind.FILE
+        }
+    }
+
+    private fun guessMimeFromName(fileName: String, hint: ComponentKind): String {
+        val f = fileName.lowercase()
+        return when {
+            f.endsWith(".png") -> "image/png"
+            f.endsWith(".jpg") || f.endsWith(".jpeg") -> "image/jpeg"
+            f.endsWith(".webp") -> "image/webp"
+            f.endsWith(".wav") -> "audio/wav"
+            f.endsWith(".mp3") -> "audio/mpeg"
+            f.endsWith(".m4a") -> "audio/mp4"
+            f.endsWith(".flac") -> "audio/flac"
+            f.endsWith(".mp4") -> "video/mp4"
+            f.endsWith(".webm") -> "video/webm"
+            hint == ComponentKind.IMAGE -> "image/png"
+            hint == ComponentKind.AUDIO -> "audio/wav"
+            hint == ComponentKind.VIDEO -> "video/mp4"
+            else -> "application/octet-stream"
+        }
+    }
+
+    private suspend fun handleJobFailure(
+        jobId: String,
+        manifest: SpaceManifest,
+        endpoint: EndpointManifest,
+        startedAt: Long,
+        declaredGpuSec: Int?,
+        error: String,
+        isQuota: Boolean,
+        onDiagnostic: (String) -> Unit
+    ) {
+        val now = System.currentTimeMillis()
+        val friendlyError = when {
+            isQuota -> "ZeroGPU quota limit reached or requested GPU duration exceeded. Sign in with a Hugging Face account (or PRO) in Vault, or retry after quota resets.\nDetails: $error"
+            error.contains("503") || error.contains("sleeping", true) -> "Space is waking up or paused. Give it a moment, or open Full Space View to trigger startup."
+            error.contains("401") || error.contains("403") -> "Authentication error. Check your Hugging Face token in Vault or per-Space auth settings."
+            else -> error
+        }
+        _activeJob.update {
+            it.copy(
+                status = JobStatus.FAILED,
+                progressMessage = if (isQuota) "ZeroGPU Quota Limit" else "Failed",
+                quotaMessage = if (isQuota) error else null,
+                errorMessage = friendlyError,
+                elapsedMs = now - startedAt
+            )
+        }
+        persistJobRecord(
+            jobId = jobId,
+            manifest = manifest,
+            endpoint = endpoint,
+            status = JobStatus.FAILED,
+            transport = currentTransport,
+            startedAt = startedAt,
+            finishedAt = now,
+            declaredGpuSec = declaredGpuSec,
+            summary = "Failed",
+            error = friendlyError,
+            outputs = _outputs.value
+        )
+        SpaceJobMonitorService.notifyComplete(context, "${manifest.identity.title} failed", friendlyError.take(120))
+        onDiagnostic("Job failed: $friendlyError")
+    }
+
+    private suspend fun persistJobRecord(
+        jobId: String,
+        manifest: SpaceManifest,
+        endpoint: EndpointManifest,
+        status: JobStatus,
+        transport: String,
+        startedAt: Long,
+        finishedAt: Long?,
+        declaredGpuSec: Int?,
+        summary: String,
+        error: String?,
+        outputs: List<OutputItem>
+    ) {
+        val outSummaryJson = JSONArray().apply {
+            outputs.forEach { o ->
+                put(JSONObject().apply {
+                    put("label", o.label)
+                    put("kind", o.kind.name)
+                    o.textValue?.let { put("text", it.take(300)) }
+                    o.localCachedPath?.let { put("localPath", it) }
+                    o.mediaAssetId?.let { put("mediaAssetId", it) }
+                })
+            }
+        }.toString()
+
+        jobRecordDao.upsertJob(
+            JobRecordEntity(
+                jobId = jobId,
+                spaceId = manifest.identity.spaceId,
+                endpointLabel = endpoint.label,
+                status = status.name,
+                transport = transport,
+                startedAtMs = startedAt,
+                finishedAtMs = finishedAt,
+                elapsedMs = (finishedAt ?: System.currentTimeMillis()) - startedAt,
+                declaredZeroGpuSeconds = declaredGpuSec,
+                summaryText = summary,
+                errorMessage = error,
+                outputsJson = outSummaryJson
+            )
+        )
+    }
+
+    private fun summarizeOutputs(items: List<OutputItem>): String {
+        if (items.isEmpty()) return "No outputs returned"
+        return items.joinToString(", ") { item ->
+            when (item.kind) {
+                ComponentKind.IMAGE -> "Image (${item.fileName ?: item.label})"
+                ComponentKind.GALLERY -> "Gallery (${item.galleryItems.size} items)"
+                ComponentKind.AUDIO -> "Audio (${item.fileName ?: item.label})"
+                ComponentKind.VIDEO -> "Video (${item.fileName ?: item.label})"
+                ComponentKind.FILE -> "File (${item.fileName ?: item.label})"
+                else -> item.textValue?.take(48)?.replace("\n", " ") ?: item.label
+            }
+        }
+    }
+
+    companion object {
+        fun defaultValueForField(field: ComponentField): FieldValue {
+            val raw = field.defaultValueJson?.trim()
+            return when (field.kind) {
+                ComponentKind.SLIDER, ComponentKind.NUMBER -> {
+                    val d = raw?.toDoubleOrNull() ?: field.min ?: 0.0
+                    FieldValue.NumberVal(d)
+                }
+                ComponentKind.CHECKBOX -> {
+                    FieldValue.BoolVal(raw.equals("true", ignoreCase = true))
+                }
+                ComponentKind.CHECKBOX_GROUP -> {
+                    val parsed = if (raw != null && raw.startsWith("[")) {
+                        runCatching {
+                            val a = JSONArray(raw)
+                            (0 until a.length()).map { a.optString(it) }.filter { it.isNotBlank() }
+                        }.getOrDefault(emptyList())
+                    } else emptyList()
+                    FieldValue.MultiSelect(parsed)
+                }
+                ComponentKind.DROPDOWN -> {
+                    if (field.multiSelect) {
+                        val parsed = if (raw != null && raw.startsWith("[")) {
+                            runCatching {
+                                val a = JSONArray(raw)
+                                (0 until a.length()).map { a.optString(it) }.filter { it.isNotBlank() }
+                            }.getOrDefault(emptyList())
+                        } else emptyList()
+                        FieldValue.MultiSelect(parsed)
+                    } else {
+                        val s = unquoteJson(raw) ?: field.choices.firstOrNull().orEmpty()
+                        FieldValue.Text(s)
+                    }
+                }
+                ComponentKind.RADIO -> {
+                    val s = unquoteJson(raw) ?: field.choices.firstOrNull().orEmpty()
+                    FieldValue.Text(s)
+                }
+                ComponentKind.IMAGE, ComponentKind.AUDIO, ComponentKind.VIDEO, ComponentKind.FILE -> FieldValue.Empty
+                ComponentKind.MULTIMODAL -> FieldValue.Multimodal(text = unquoteJson(raw).orEmpty())
+                ComponentKind.JSON, ComponentKind.UNKNOWN, ComponentKind.DATAFRAME -> {
+                    FieldValue.StructuredJson(raw ?: "")
+                }
+                ComponentKind.STATE -> FieldValue.Empty
+                else -> FieldValue.Text(unquoteJson(raw).orEmpty())
+            }
+        }
+
+        private fun unquoteJson(raw: String?): String? {
+            if (raw == null || raw == "null") return null
+            return if (raw.startsWith("\"") && raw.endsWith("\"") && raw.length >= 2) {
+                runCatching { JSONObject("{\"v\":$raw}").getString("v") }.getOrDefault(raw.trim('"'))
+            } else raw
+        }
+    }
+}
